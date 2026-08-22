@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS (Apple Silicon)
+            asset: ps4-pkg-installer-macos-arm64
+          - os: macos-13
+            label: macOS (Intel)
+            asset: ps4-pkg-installer-macos-x64
+          - os: windows-latest
+            label: Windows
+            asset: ps4-pkg-installer-windows-x64
+          - os: ubuntu-latest
+            label: Linux
+            asset: ps4-pkg-installer-linux-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --name "PS4 PKG Installer"
+          --collect-all flet
+          --collect-all flet_desktop
+          ps4_pkg_installer.py
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -qry "../${{ matrix.asset }}.zip" "PS4 PKG Installer.app"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/PS4 PKG Installer.exe" -DestinationPath "${{ matrix.asset }}.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd dist
+          tar czf "../${{ matrix.asset }}.tar.gz" "PS4 PKG Installer"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.zip
+            ${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ls -lh assets
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            --notes "Prebuilt binaries below need no Python installed.
+
+          **macOS:** unzip and run. The build is unsigned, so on first launch use
+          right-click → Open, or \`xattr -dr com.apple.quarantine \"PS4 PKG Installer.app\"\`.
+
+          **Windows:** unzip and run the \`.exe\`.
+
+          **Linux:** \`tar xzf\` and run the binary (\`chmod +x\` if needed).
+
+          Prefer running from source? \`pip install -r requirements.txt && python3 ps4_pkg_installer.py\`" \
+            assets/* \
+          || gh release upload "$TAG" assets/* --clobber
