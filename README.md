@@ -67,11 +67,12 @@ Grab your platform's archive from the **[latest release](https://github.com/Koni
 | Platform | File |
 |---|---|
 | macOS (Apple Silicon) | `ps4-pkg-installer-macos-arm64.zip` |
-| macOS (Intel) | `ps4-pkg-installer-macos-x64.zip` |
 | Windows | `ps4-pkg-installer-windows-x64.zip` |
 | Linux | `ps4-pkg-installer-linux-x64.tar.gz` |
 
-The macOS builds are unsigned, so Gatekeeper will complain the first time. Right-click → *Open*, or:
+Intel Macs are not covered by a prebuilt binary — GitHub's `macos-13` runners are being retired and queue indefinitely. Run from source, or build your own with the command further down; both work fine on Intel.
+
+The macOS build is unsigned, so Gatekeeper will complain the first time. Right-click → *Open*, or:
 
 ```bash
 xattr -dr com.apple.quarantine "PS4 PKG Installer.app"

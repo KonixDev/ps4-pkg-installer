@@ -23,9 +23,6 @@ jobs:
           - os: macos-latest
             label: macOS (Apple Silicon)
             asset: ps4-pkg-installer-macos-arm64
-          - os: macos-13
-            label: macOS (Intel)
-            asset: ps4-pkg-installer-macos-x64
           - os: windows-latest
             label: Windows
             asset: ps4-pkg-installer-windows-x64
@@ -44,6 +41,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
+          # flet_desktop trae el runtime de Flutter (~45 MB). Sin él, PyInstaller
+          # no falla pero produce un binario que muere al arrancar con
+          # "ModuleNotFoundError: No module named 'flet_desktop'".
+          python -c "import flet_desktop, os; print('flet_desktop OK:', os.path.dirname(flet_desktop.__file__))"
 
       - name: Build
         run: >
@@ -52,6 +53,20 @@ jobs:
           --collect-all flet
           --collect-all flet_desktop
           ps4_pkg_installer.py
+
+      - name: Verify the runtime got bundled
+        shell: bash
+        run: |
+          # Un binario sano ronda los 50-70 MB. Si sale ~10 MB, el runtime de
+          # Flutter quedó afuera y el ejecutable no arranca.
+          BIN=$(find dist -maxdepth 3 -type f \( -name "PS4 PKG Installer" -o -name "PS4 PKG Installer.exe" \) | head -1)
+          echo "binario: $BIN"
+          SIZE=$(python -c "import os,sys; print(os.path.getsize(sys.argv[1]))" "$BIN")
+          echo "tamaño: $((SIZE / 1024 / 1024)) MB"
+          if [ "$SIZE" -lt 35000000 ]; then
+            echo "::error::El binario pesa menos de 35 MB: el runtime de Flet no quedó embebido."
+            exit 1
+          fi
 
       - name: Package (macOS)
         if: runner.os == 'macOS'

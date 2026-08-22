@@ -67,11 +67,12 @@ Bajate el archivo de tu plataforma desde la **[última release](https://github.c
 | Plataforma | Archivo |
 |---|---|
 | macOS (Apple Silicon) | `ps4-pkg-installer-macos-arm64.zip` |
-| macOS (Intel) | `ps4-pkg-installer-macos-x64.zip` |
 | Windows | `ps4-pkg-installer-windows-x64.zip` |
 | Linux | `ps4-pkg-installer-linux-x64.tar.gz` |
 
-Las builds de macOS van sin firmar, así que Gatekeeper va a protestar la primera vez. Clic derecho → *Abrir*, o:
+Para Mac Intel no hay binario precompilado: los runners `macos-13` de GitHub están siendo retirados y quedan encolados sin fin. Corré desde el código fuente, o compilalo vos con el comando de más abajo; en Intel funciona igual.
+
+La build de macOS va sin firmar, así que Gatekeeper va a protestar la primera vez. Clic derecho → *Abrir*, o:
 
 ```bash
 xattr -dr com.apple.quarantine "PS4 PKG Installer.app"
