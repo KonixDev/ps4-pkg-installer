@@ -23,6 +23,7 @@ from pathlib import Path
 import flet as ft
 
 import archives
+import pkgmeta
 
 # ---------------------------------------------------------------- paleta
 
@@ -121,6 +122,56 @@ def human_eta(seconds):
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+def matches(pkg, query):
+    """
+    ¿Este paquete pasa el filtro?
+
+    Busca en el título del juego, el nombre de archivo y la subcarpeta: con
+    títulos legibles se filtra por "marrakesh", pero el nombre de archivo sigue
+    siendo lo único que distingue dos volcados del mismo juego.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    campos = (pkg.get("title", ""), pkg.get("name", ""), pkg.get("sub", ""))
+    return any(q in (c or "").lower() for c in campos)
+
+
+def apply_bulk(pkgs, accion, visibles):
+    """
+    Aplica una acción de conjunto SOLO sobre los índices visibles.
+
+    Lo que el filtro esconde conserva su tilde: es la única semántica que no
+    sorprende. Y nunca se pisa un paquete cuyo checkbox está deshabilitado,
+    que es como se marca una tarea ya en curso.
+    """
+    for i, pkg in enumerate(pkgs):
+        if i not in visibles:
+            continue
+        cb = pkg.get("cb")
+        if cb is None or cb.disabled:
+            continue
+        if accion == "all":
+            cb.value = True
+        elif accion == "none":
+            cb.value = False
+        else:
+            cb.value = not cb.value
+
+
+def group_key(pkg):
+    """
+    Orden: primero por categoría, después por título.
+
+    El orden de CATEGORY_ORDER (juego, actualización, contenido) es también el
+    orden correcto de instalación, así que la lista queda ordenada como hay que
+    instalarla sin que nadie tenga que saberlo.
+    """
+    cat = pkg.get("category") or ""
+    return (pkgmeta.CATEGORY_ORDER.get(cat, 9),
+            (pkg.get("title") or pkg.get("name") or "").lower())
 
 
 def choose_folder(initial=None):
@@ -351,7 +402,7 @@ class App:
                     ft.Row(
                         spacing=13,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
+                        controls=([
                             ft.Container(
                                 width=27,
                                 height=27,
@@ -363,6 +414,7 @@ class App:
                                     str(step), size=13.5, weight=ft.FontWeight.BOLD, color=BLUE
                                 ),
                             ),
+                        ] if step else []) + [
                             ft.Column(
                                 spacing=1,
                                 controls=[
@@ -450,7 +502,12 @@ class App:
                             ),
                         ],
                     ),
-                    ft.Row(spacing=8, controls=[self.chip_server, self.chip_ps4]),
+                    ft.Row(spacing=8, controls=[
+                        self.chip_server, self.chip_ps4,
+                        ft.IconButton(ft.Icons.SETTINGS_OUTLINED, icon_size=19,
+                                      icon_color=MUTED, tooltip="Conexión y servidor",
+                                      on_click=self.open_settings),
+                    ]),
                 ],
             ),
         )
@@ -466,7 +523,7 @@ class App:
         self.f_port.on_blur = self.on_port_change
 
         card1 = self._card(
-            1,
+            None,
             "Conexión",
             f"La PS4 debe estar en modo debug, escuchando en el puerto {PS4_PORT}",
             ft.Row(
@@ -552,41 +609,74 @@ class App:
         self.manual_path.visible = False
         self.manual_path.on_submit = self.on_manual_path
 
-        card2 = self._card(
-            2,
-            "Paquetes",
-            "Elegí la carpeta donde están tus archivos .pkg",
-            ft.Column(
+        folder_row = ft.Container(
+            bgcolor=SURFACE_2,
+            border=ft.border.all(1, BORDER),
+            border_radius=10,
+            padding=ft.padding.only(14, 4, 6, 4),
+            content=ft.Row(
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Icon(ft.Icons.FOLDER_OUTLINED, size=18, color=MUTED),
+                    self.folder_label,
+                    ft.TextButton(
+                        content=ft.Text("Cambiar", size=13.5, color=BLUE),
+                        on_click=self.on_pick_folder,
+                    ),
+                    ft.IconButton(
+                        ft.Icons.REFRESH, icon_size=18, icon_color=MUTED,
+                        tooltip="Volver a escanear",
+                        on_click=lambda _: self.scan_folder(),
+                    ),
+                ],
+            ),
+        )
+
+        # --- toolbar: filtro, acciones de conjunto y modo de vista ---
+        self.view_mode = "rows"
+        self.f_filter = ft.TextField(
+            hint_text="Filtrar…", dense=True, height=40, expand=True,
+            border_color=BORDER, color=TEXT, text_size=13,
+            prefix_icon=ft.Icons.SEARCH, on_change=lambda _: self.rebuild_list(),
+        )
+        self.visible_label = ft.Text("", size=12, color=MUTED)
+        self.seg_view = ft.SegmentedButton(
+            selected={"rows"},
+            show_selected_icon=False,
+            segments=[
+                ft.Segment(value="rows", label=ft.Text("Lista", size=12.5),
+                           icon=ft.Icon(ft.Icons.VIEW_LIST_ROUNDED, size=16)),
+                ft.Segment(value="tiles", label=ft.Text("Cuadrícula", size=12.5),
+                           icon=ft.Icon(ft.Icons.GRID_VIEW_ROUNDED, size=16)),
+            ],
+            on_change=self.on_view_change,
+        )
+        toolbar = ft.Row(
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Container(width=230, content=self.f_filter),
+                ft.TextButton(content=ft.Text("Todos", size=12.5, color=BLUE),
+                              on_click=lambda _: self.on_bulk("all")),
+                ft.TextButton(content=ft.Text("Ninguno", size=12.5, color=BLUE),
+                              on_click=lambda _: self.on_bulk("none")),
+                ft.TextButton(content=ft.Text("Invertir", size=12.5, color=BLUE),
+                              on_click=lambda _: self.on_bulk("invert")),
+                ft.Container(expand=True),
+                self.seg_view,
+                self.visible_label,
+            ],
+        )
+
+        card2 = ft.Column(
                 spacing=11,
                 expand=True,
                 controls=[
-                    ft.Container(
-                        bgcolor=SURFACE_2,
-                        border=ft.border.all(1, BORDER),
-                        border_radius=10,
-                        padding=ft.padding.only(14, 4, 6, 4),
-                        content=ft.Row(
-                            spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Icon(ft.Icons.FOLDER_OUTLINED, size=18, color=MUTED),
-                                self.folder_label,
-                                ft.TextButton(
-                                    content=ft.Text("Cambiar", size=13.5, color=BLUE),
-                                    on_click=self.on_pick_folder,
-                                ),
-                                ft.IconButton(
-                                    ft.Icons.REFRESH,
-                                    icon_size=18,
-                                    icon_color=MUTED,
-                                    tooltip="Volver a escanear",
-                                    on_click=lambda _: self.scan_folder(),
-                                ),
-                            ],
-                        ),
-                    ),
+                    folder_row,
                     self.manual_path,
                     self.arch_banner,
+                    toolbar,
                     ft.Container(
                         expand=True,
                         bgcolor=SURFACE_2,
@@ -596,8 +686,6 @@ class App:
                     ),
                     self.count_label,
                 ],
-            ),
-            expand=3,
         )
 
         # --- paso 3: instalar ---------------------------------------
@@ -678,7 +766,7 @@ class App:
             bgcolor=SURFACE,
             border=ft.border.all(1, BORDER),
             border_radius=14,
-            expand=2,
+            expand=True,
             content=ft.Column(
                 spacing=0,
                 expand=True,
@@ -720,25 +808,49 @@ class App:
             ),
         )
 
-        # --- raíz ---------------------------------------------------
+        # --- conexión: deja de ser un paso y pasa a ser configuración ---
+        # IP local y puerto se tocan una vez en la vida; ocupaban una tarjeta
+        # entera arriba de todo. Se van al engranaje y el encabezado se queda
+        # con lo único que importa a diario: si la consola responde.
+        self.settings_dlg = ft.AlertDialog(
+            bgcolor=SURFACE,
+            content=ft.Container(width=560, content=card1),
+            actions=[ft.TextButton("Listo", on_click=lambda _: self.close_settings())],
+        )
+
+        # --- raíz: dos pestañas, la lista se queda con la ventana ---
+        self.tabs = ft.Tabs(
+            selected_index=0,
+            expand=True,
+            animation_duration=160,
+            indicator_color=BLUE,
+            label_color=TEXT,
+            unselected_label_color=MUTED,
+            divider_color=BORDER,
+            tabs=[
+                ft.Tab(
+                    text="Instalar",
+                    content=ft.Container(
+                        padding=ft.padding.only(20, 14, 20, 14),
+                        content=ft.Column(
+                            spacing=12, expand=True, controls=[card2, action_bar]
+                        ),
+                    ),
+                ),
+                ft.Tab(
+                    text="Registro",
+                    content=ft.Container(
+                        padding=ft.padding.only(20, 14, 20, 14), content=console
+                    ),
+                ),
+            ],
+        )
+
         self.root = ft.Container(
             expand=True,
             bgcolor=BG,
             content=ft.Column(
-                spacing=0,
-                expand=True,
-                controls=[
-                    header,
-                    ft.Container(
-                        expand=True,
-                        padding=ft.padding.only(24, 0, 24, 22),
-                        content=ft.Column(
-                            spacing=13,
-                            expand=True,
-                            controls=[card1, card2, action_bar, console],
-                        ),
-                    ),
-                ],
+                spacing=0, expand=True, controls=[header, self.tabs],
             ),
         )
 
@@ -1066,38 +1178,193 @@ class App:
                     "state": "idle", "task_id": None, "polling": False,
                     "served": 0, "transferred": 0, "length": 0, "rest_sec": 0,
                     "served_pos": 0, "stale": False,
+                    "title": "", "category": "", "version": "", "icon": None,
                 }
             pkg["cb"] = ft.Checkbox(
                 value=True, active_color=BLUE, on_change=lambda _: self._refresh_count()
             )
             self.pkgs.append(pkg)
-            self.pkg_list.controls.append(self._build_row(pkg))
 
         self._prev_pkgs = list(self.pkgs)
 
         if not found:
-            self.pkg_list.controls.append(
-                ft.Container(
-                    padding=26,
-                    alignment=ft.alignment.center,
-                    content=ft.Column(
-                        spacing=8,
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.Icon(ft.Icons.FOLDER_OFF_OUTLINED, size=30, color="#4a505c"),
-                            ft.Text("No hay archivos .pkg acá", size=13.5, color=MUTED),
-                            ft.Text("Se busca también en las subcarpetas", size=11.5, color="#5a616e"),
-                        ],
-                    ),
-                )
-            )
             self.log("No se encontraron .pkg ni en la carpeta ni en sus subcarpetas", "warn")
         else:
             subs = len({p["sub"] for p in self.pkgs if p.get("sub")})
             extra = f" en {subs} subcarpeta(s)" if subs else ""
             self.log(f"{len(found)} paquete(s) encontrado(s){extra}", "ok")
 
+        self.rebuild_list()
         self._scan_archives()
+        self._load_meta_async()
+
+    def _load_meta_async(self):
+        """
+        Lee título, categoría e ícono de cada PKG en un thread.
+
+        Abrir cientos de archivos y volcar sus carátulas no puede pasar en el
+        hilo de la UI. Los paquetes ya se listaron con su nombre de archivo;
+        cuando la metadata llega, la lista se reordena y se repinta sola.
+        """
+        objetivo = list(self.pkgs)
+
+        def worker():
+            hubo = False
+            for pkg in objetivo:
+                if self.stopping or pkg not in self.pkgs:
+                    return
+                info = pkgmeta.read_pkg(pkg["path"])
+                if not info:
+                    continue
+                pkg["title"] = info.title
+                pkg["category"] = info.category
+                pkg["version"] = info.version
+                pkg["icon"] = pkgmeta.icon_path(pkg["path"], info)
+                hubo = hubo or bool(info.title)
+            if self.stopping:
+                return
+            # El orden por categoría es también el orden de instalación.
+            self.pkgs.sort(key=group_key)
+            self.rebuild_list()
+            if hubo:
+                grupos = {}
+                for pkg in self.pkgs:
+                    grupos[pkg.get("category") or ""] = grupos.get(pkg.get("category") or "", 0) + 1
+                detalle = ", ".join(
+                    f"{n} {(pkgmeta.CATEGORIES.get(c) or 'sin clasificar').lower()}"
+                    for c, n in sorted(grupos.items(), key=lambda kv: pkgmeta.CATEGORY_ORDER.get(kv[0], 9))
+                )
+                self.log(f"Metadata leída · {detalle}", "ok")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------ vista de la lista
+
+    def open_settings(self, _=None):
+        self.page.open(self.settings_dlg)
+
+    def close_settings(self, _=None):
+        self.page.close(self.settings_dlg)
+
+    def on_bulk(self, accion):
+        """Todos / Ninguno / Invertir, siempre sobre lo que dejó el filtro."""
+        visibles = {i for i, p in enumerate(self.pkgs)
+                    if matches(p, self.f_filter.value)}
+        apply_bulk(self.pkgs, accion, visibles)
+        self.rebuild_list()
+
+    def on_view_change(self, e):
+        self.view_mode = next(iter(e.control.selected), "rows")
+        self.rebuild_list()
+
+    def _group_header(self, cat, n):
+        """Encabezado de grupo: qué es y cuántos hay."""
+        return ft.Container(
+            padding=ft.padding.only(8, 12, 8, 4),
+            content=ft.Row(
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Text((pkgmeta.CATEGORIES.get(cat) or "Otros").upper(),
+                            size=10.5, weight=ft.FontWeight.W_600, color=MUTED),
+                    ft.Container(expand=True, height=1, bgcolor=BORDER),
+                    ft.Text(str(n), size=10.5, color="#69707d"),
+                ],
+            ),
+        )
+
+    def _tile(self, pkg):
+        """
+        Tarjeta para la vista cuadrícula.
+
+        Sirve para elegir: catorce carátulas se reconocen de un vistazo,
+        catorce nombres de archivo no. Para mirar instalar sigue siendo mejor
+        la lista, que tiene ancho para la barra y alinea los tamaños.
+        """
+        seleccionado = bool(pkg["cb"].value)
+        estado = pkg.get("state", "idle")
+        etiqueta, color, _ = self.STATES.get(estado, self.STATES["idle"])
+
+        arte = (
+            ft.Image(src=pkg["icon"], width=112, height=112, border_radius=7,
+                     fit=ft.ImageFit.COVER)
+            if pkg.get("icon") else
+            ft.Container(width=112, height=112, border_radius=7, bgcolor=SURFACE_2,
+                         alignment=ft.alignment.center,
+                         content=ft.Icon(ft.Icons.INVENTORY_2_OUTLINED, size=26, color=MUTED))
+        )
+
+        def alternar(_, p=pkg):
+            if p["cb"].disabled:
+                return
+            p["cb"].value = not p["cb"].value
+            self.rebuild_list()
+
+        return ft.Container(
+            width=130, padding=9, border_radius=9,
+            bgcolor="#14273d" if seleccionado else BG,
+            border=ft.border.all(1, BLUE if seleccionado else BORDER),
+            on_click=alternar, ink=True,
+            content=ft.Column(spacing=7, controls=[
+                arte,
+                ft.Text(pkg.get("title") or pkg["name"], size=11.5, color=TEXT,
+                        max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+                    ft.Text(human_size(pkg["size"]), size=10.5, color=MUTED),
+                    ft.Text(etiqueta, size=10.5, color=color),
+                ]),
+            ]),
+        )
+
+    def rebuild_list(self):
+        """
+        Rearma la lista visible: filtra, agrupa por categoría y pinta.
+
+        Se rearma en vez de ocultar porque el cambio de vista cambia el tipo de
+        control. El estado vivo de cada paquete vive en su dict, no en la fila,
+        así que reconstruir no corta ninguna tarea en curso.
+        """
+        if not hasattr(self, "pkg_list"):
+            return
+        self.pkg_list.controls.clear()
+        q = self.f_filter.value if hasattr(self, "f_filter") else ""
+        visibles = [p for p in self.pkgs if matches(p, q)]
+
+        cur = object()
+        cajon = None
+        for pkg in visibles:
+            cat = pkg.get("category") or ""
+            if cat != cur:
+                cur = cat
+                n = sum(1 for p in visibles if (p.get("category") or "") == cat)
+                self.pkg_list.controls.append(self._group_header(cat, n))
+                cajon = None
+                if self.view_mode == "tiles":
+                    cajon = ft.Row(wrap=True, spacing=8, run_spacing=8)
+                    self.pkg_list.controls.append(cajon)
+            control = self._tile(pkg) if self.view_mode == "tiles" else self._build_row(pkg)
+            (cajon.controls if cajon is not None else self.pkg_list.controls).append(control)
+
+        if not visibles:
+            self.pkg_list.controls.append(
+                ft.Container(
+                    padding=26, alignment=ft.alignment.center,
+                    content=ft.Column(
+                        spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[
+                            ft.Icon(ft.Icons.FOLDER_OFF_OUTLINED, size=30, color="#4a505c"),
+                            ft.Text("No hay paquetes que mostrar", size=13.5, color=MUTED),
+                        ],
+                    ),
+                )
+            )
+
+        oculto = len(self.pkgs) - len(visibles)
+        self.visible_label.value = (
+            f"{len(visibles)} a la vista · {oculto} ocultos" if oculto else ""
+        )
+        if self.view_mode == "rows":
+            self.refresh_rows()
         self._refresh_count()
 
     def _scan_archives(self):
@@ -1207,6 +1474,14 @@ class App:
         "queued":      ("En cola, sin confirmar", AMBER, ft.Icons.PENDING_ROUNDED),
     }
 
+    # La franja izquierda repite el estado en forma además de en texto: con
+    # dieciséis paquetes, encontrar el que necesita atención deja de ser lectura.
+    STRIPE = {
+        "sending": BLUE, "preparing": BLUE, "downloading": BLUE,
+        "installing": AMBER, "paused": AMBER, "waiting": AMBER, "queued": AMBER,
+        "done": GREEN, "error": RED,
+    }
+
     def _build_row(self, pkg):
         """Fila con estado, barra de progreso y controles de la tarea."""
         pkg["ui_state"] = ft.Text("", size=12, color=MUTED)
@@ -1228,47 +1503,49 @@ class App:
             tooltip="Cancelar", on_click=lambda _, p=pkg: self.task_action(p, "stop_task"),
         )
 
+        pkg["ui_stripe"] = ft.Container(width=3, height=38, border_radius=2,
+                                        bgcolor="transparent")
+        # Un paquete sin carátula no deja un hueco: muestra el marcador. De 18
+        # paquetes reales, uno no traía icon0.png.
+        caratula = (
+            ft.Image(src=pkg["icon"], width=34, height=34, border_radius=6,
+                     fit=ft.ImageFit.COVER)
+            if pkg.get("icon") else
+            ft.Container(width=34, height=34, border_radius=6, bgcolor=SURFACE_2,
+                         alignment=ft.alignment.center,
+                         content=ft.Icon(ft.Icons.INVENTORY_2_OUTLINED, size=16, color=MUTED))
+        )
+        titulo = pkg.get("title") or pkg["name"]
+
         row = ft.Container(
-            padding=ft.padding.symmetric(6, 10),
+            padding=ft.padding.only(0, 6, 10, 6),
             border_radius=8,
-            content=ft.Column(
-                spacing=5,
+            content=ft.Row(
+                spacing=9,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
-                    ft.Row(
-                        spacing=9,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    pkg["ui_stripe"],
+                    pkg["cb"],
+                    caratula,
+                    ft.Column(
+                        spacing=1,
+                        expand=True,
                         controls=[
-                            pkg["cb"],
-                            pkg["ui_icon"],
-                            ft.Column(
-                                spacing=1,
-                                expand=True,
-                                controls=[
-                                    ft.Text(
-                                        pkg["name"], size=13.5, color=TEXT,
-                                        no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
-                                    ),
-                                ] + ([
-                                    ft.Row(
-                                        spacing=4,
-                                        controls=[
-                                            ft.Icon(ft.Icons.SUBDIRECTORY_ARROW_RIGHT_ROUNDED,
-                                                    size=11, color="#5a616e"),
-                                            ft.Text(
-                                                pkg["sub"], size=11, color="#5a616e",
-                                                no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
-                                            ),
-                                        ],
-                                    )
-                                ] if pkg.get("sub") else []),
-                            ),
-                            pkg["ui_state"],
-                            pkg["ui_pause"], pkg["ui_resume"], pkg["ui_stop"],
-                            ft.Text(human_size(pkg["size"]), size=12, color=MUTED),
+                            ft.Text(titulo, size=13, color=TEXT,
+                                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                            # El nombre de archivo baja a segunda línea: sigue
+                            # siendo lo único que distingue dos volcados del
+                            # mismo juego, pero deja de ser lo primero que se lee.
+                            ft.Text(pkg["name"], size=10.5, color="#69707d",
+                                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                            pkg["ui_bar"],
+                            pkg["ui_detail"],
                         ],
                     ),
-                    pkg["ui_bar"],
-                    pkg["ui_detail"],
+                    ft.Text(human_size(pkg["size"]), size=11.5, color=MUTED,
+                            width=72, text_align=ft.TextAlign.RIGHT),
+                    pkg["ui_state"],
+                    pkg["ui_pause"], pkg["ui_resume"], pkg["ui_stop"],
                 ],
             ),
         )
@@ -1294,6 +1571,8 @@ class App:
         label, color, icon = self.STATES.get(state, self.STATES["idle"])
 
         pkg["ui_icon"].name, pkg["ui_icon"].color = icon, color
+        if "ui_stripe" in pkg:
+            pkg["ui_stripe"].bgcolor = self.STRIPE.get(state) or "transparent"
         pkg["ui_state"].value, pkg["ui_state"].color = label, color
 
         active = state in ("preparing", "downloading", "installing", "paused")
@@ -1333,6 +1612,12 @@ class App:
             pkg["ui_detail"].value = pkg.get("error", "")
 
     def refresh_rows(self):
+        if getattr(self, "view_mode", "rows") == "tiles":
+            # Los tiles no tienen controles vivos que repintar: se rearman.
+            self.rebuild_list()
+            self._update_overall()
+            self._safe_update()
+            return
         for pkg in self.pkgs:
             if "ui_bar" in pkg:
                 self._paint_row(pkg)
@@ -1593,8 +1878,6 @@ class App:
             self.log(f"La PS4 está descargando {name}", "step")
             return
 
-        self.log(f"La PS4 pide {rng} de {name}", "step")
-
         m = self._RE_RANGE_START.match(rng.strip())
         if not m:
             return
@@ -1608,6 +1891,18 @@ class App:
             if start > pkg.get("served_pos", 0):
                 pkg["served_pos"] = start
                 self.refresh_rows()
+
+            # Antes cada rango servido escribía su propia línea: docenas por
+            # paquete, todas casi iguales, y los mensajes que importan se
+            # ahogaban. Ahora es una línea de avance cada 15 segundos.
+            ahora = time.time()
+            if ahora - pkg.get("last_log", 0) >= 15:
+                pkg["last_log"] = ahora
+                hechos, total = self._progress_of(pkg)
+                self.log(
+                    f"{pkg.get('title') or name} · {human_size(hechos)} de "
+                    f"{human_size(total)} servidos", "step",
+                )
             break
 
     # ------------------------------------------------------------ extracción

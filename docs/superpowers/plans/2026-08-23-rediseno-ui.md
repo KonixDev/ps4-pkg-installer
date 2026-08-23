@@ -1,6 +1,6 @@
 # Rediseño de la UI — Plan de implementación
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Que la app muestre juegos en vez de nombres de archivo — título e ícono leídos del propio PKG, agrupados por categoría — y que la lista pueda filtrarse y seleccionarse en conjunto, con el registro fuera de la pantalla principal.
 
@@ -41,7 +41,7 @@
 - Consumes: nada
 - Produces: `PkgInfo` (dataclass: `title: str`, `title_id: str`, `category: str`, `version: str`, `icon_offset: int`, `icon_size: int`), `read_pkg(path: str) -> PkgInfo | None` — None si no es un PKG legible
 
-- [ ] **Step 1: Escribir el test que falla**
+- [x] **Step 1: Escribir el test que falla**
 
 `tests/test_pkgmeta.py`:
 
@@ -136,12 +136,12 @@ def test_pkg_sin_sfo_no_explota(tmp_path):
     assert info.icon_size == 0
 ```
 
-- [ ] **Step 2: Correr y verificar que falla**
+- [x] **Step 2: Correr y verificar que falla**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/test_pkgmeta.py -v`
 Expected: FAIL con `ModuleNotFoundError: No module named 'pkgmeta'`
 
-- [ ] **Step 3: Implementar el parseo**
+- [x] **Step 3: Implementar el parseo**
 
 ```python
 #!/usr/bin/env python3
@@ -262,12 +262,12 @@ def read_pkg(path):
         return None
 ```
 
-- [ ] **Step 4: Correr los tests y verificar que pasan**
+- [x] **Step 4: Correr los tests y verificar que pasan**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/test_pkgmeta.py -v`
 Expected: PASS (4 tests)
 
-- [ ] **Step 5: Verificar contra paquetes reales**
+- [x] **Step 5: Verificar contra paquetes reales**
 
 Si hay PKG en `~/Downloads/PS4`, correr a mano:
 
@@ -282,7 +282,7 @@ for p in sorted(glob.glob('/Users/cellcaribe/Downloads/PS4/**/*.pkg', recursive=
 
 Esperado: títulos legibles y categorías `gd` / `gp` / `ac`. Si sale vacío, el parseo está mal aunque los tests pasen.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ps4-pkg-installer
@@ -304,7 +304,7 @@ Flet dibuja imágenes desde un archivo. Volcar el `icon0.png` una vez y reusarlo
 - Consumes: `read_pkg` / `PkgInfo` (Task 1)
 - Produces: `icon_path(pkg_path: str, info: PkgInfo, cache_dir: str | None = None) -> str | None` — ruta al PNG en caché, o None si el paquete no trae ícono
 
-- [ ] **Step 1: Escribir los tests que fallan**
+- [x] **Step 1: Escribir los tests que fallan**
 
 ```python
 def test_extrae_el_icono_al_cache(tmp_path):
@@ -338,12 +338,12 @@ def test_sin_icono_devuelve_None(tmp_path):
     assert pkgmeta.icon_path("/x/y.pkg", info, str(tmp_path)) is None
 ```
 
-- [ ] **Step 2: Correr y verificar que fallan**
+- [x] **Step 2: Correr y verificar que fallan**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/test_pkgmeta.py -v -k icono or cache`
 Expected: FAIL con `AttributeError: module 'pkgmeta' has no attribute 'icon_path'`
 
-- [ ] **Step 3: Implementar el caché**
+- [x] **Step 3: Implementar el caché**
 
 Agregar a `pkgmeta.py`:
 
@@ -392,12 +392,12 @@ def icon_path(pkg_path, info, cache_dir=None):
         return None
 ```
 
-- [ ] **Step 4: Correr los tests y verificar que pasan**
+- [x] **Step 4: Correr los tests y verificar que pasan**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/test_pkgmeta.py -v`
 Expected: PASS (7 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ps4-pkg-installer
@@ -422,7 +422,7 @@ Lógica pura, fuera de la UI, para poder testear sin ventana. Es la parte con re
   - `apply_bulk(pkgs: list[dict], accion: str, visibles: set[int]) -> None` — `accion` ∈ `"all" | "none" | "invert"`; muta `pkg["cb"].value`
   - `group_key(pkg: dict) -> tuple[int, str]` — para ordenar por categoría y después por título
 
-- [ ] **Step 1: Escribir los tests que fallan**
+- [x] **Step 1: Escribir los tests que fallan**
 
 `tests/test_ui_selection.py`:
 
@@ -519,12 +519,12 @@ def test_sin_categoria_cae_al_final():
     assert [p["title"] for p in sorted(pkgs, key=app.group_key)] == ["Juego", "Sin cat"]
 ```
 
-- [ ] **Step 2: Correr y verificar que fallan**
+- [x] **Step 2: Correr y verificar que fallan**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/test_ui_selection.py -v`
 Expected: FAIL con `AttributeError: module 'ps4_pkg_installer' has no attribute 'matches'`
 
-- [ ] **Step 3: Implementar las tres funciones**
+- [x] **Step 3: Implementar las tres funciones**
 
 En `ps4_pkg_installer.py`, después de `human_eta` y antes de `choose_folder`:
 
@@ -581,12 +581,12 @@ def group_key(pkg):
 
 Agregar `import pkgmeta` junto a `import archives`.
 
-- [ ] **Step 4: Correr los tests y verificar que pasan**
+- [x] **Step 4: Correr los tests y verificar que pasan**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/test_ui_selection.py -v`
 Expected: PASS (9 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ps4-pkg-installer
@@ -605,7 +605,7 @@ git commit -m "feat(ui): filtro, seleccion en conjunto y orden por categoria"
 - Consumes: `read_pkg`, `icon_path` (Tasks 1-2), `group_key` (Task 3)
 - Produces: cada dict de `self.pkgs` gana `title`, `category`, `version`, `icon`
 
-- [ ] **Step 1: Sumar los campos al dict de paquete**
+- [x] **Step 1: Sumar los campos al dict de paquete**
 
 En `scan_folder()`, donde se arma el dict nuevo, agregar a la definición:
 
@@ -613,7 +613,7 @@ En `scan_folder()`, donde se arma el dict nuevo, agregar a la definición:
                     "title": "", "category": "", "version": "", "icon": None,
 ```
 
-- [ ] **Step 2: Leer la metadata en segundo plano**
+- [x] **Step 2: Leer la metadata en segundo plano**
 
 Agregar el método y llamarlo al final de `scan_folder()`, junto a `self._scan_archives()`:
 
@@ -646,7 +646,7 @@ Agregar el método y llamarlo al final de `scan_folder()`, junto a `self._scan_a
         threading.Thread(target=worker, daemon=True).start()
 ```
 
-- [ ] **Step 3: Probar a mano contra paquetes reales**
+- [x] **Step 3: Probar a mano contra paquetes reales**
 
 ```bash
 cd ps4-pkg-installer && python3 ps4_pkg_installer.py
@@ -654,7 +654,7 @@ cd ps4-pkg-installer && python3 ps4_pkg_installer.py
 
 Apuntar a una carpeta con PKG reales. Esperado: la lista aparece al instante con nombres de archivo y, un momento después, se reordena mostrando títulos e íconos. La ventana no se congela en ningún momento.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cd ps4-pkg-installer
@@ -673,7 +673,7 @@ git commit -m "feat(ui): leer la metadata de cada PKG en segundo plano"
 - Consumes: `matches`, `apply_bulk` (Task 3)
 - Produces: `self.tabs`, `self.f_filter`, `self.view_mode` (`"rows"` | `"tiles"`), `self.list_container`, `self.rebuild_list()`
 
-- [ ] **Step 1: Reemplazar la estructura de `_build()`**
+- [x] **Step 1: Reemplazar la estructura de `_build()`**
 
 Sacar `_card()` y sus dos llamadas. La raíz pasa a ser:
 
@@ -736,7 +736,7 @@ Sacar `_card()` y sus dos llamadas. La raíz pasa a ser:
 
 `folder_row` es la fila de carpeta que ya existe (label + botón Cambiar), extraída de la tarjeta vieja sin cambios.
 
-- [ ] **Step 2: Los handlers de la toolbar**
+- [x] **Step 2: Los handlers de la toolbar**
 
 ```python
     def on_bulk(self, accion):
@@ -750,7 +750,7 @@ Sacar `_card()` y sus dos llamadas. La raíz pasa a ser:
         self.rebuild_list()
 ```
 
-- [ ] **Step 3: Probar que la ventana abre**
+- [x] **Step 3: Probar que la ventana abre**
 
 ```bash
 cd ps4-pkg-installer && python3 ps4_pkg_installer.py
@@ -758,7 +758,7 @@ cd ps4-pkg-installer && python3 ps4_pkg_installer.py
 
 Esperado: dos pestañas, la lista ocupando el alto, el filtro y los tres botones respondiendo. El registro en su pestaña.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cd ps4-pkg-installer
@@ -777,7 +777,7 @@ git commit -m "feat(ui): pestanas, toolbar de filtro y seleccion"
 - Consumes: `matches`, `group_key` (Task 3), `CATEGORIES` (Task 1)
 - Produces: `rebuild_list()`, `_group_header(cat, n)`, `_tile(pkg)`
 
-- [ ] **Step 1: Colores de franja por estado**
+- [x] **Step 1: Colores de franja por estado**
 
 ```python
     # La franja izquierda repite el estado en forma además de en texto: con
@@ -789,7 +789,7 @@ git commit -m "feat(ui): pestanas, toolbar de filtro y seleccion"
     }
 ```
 
-- [ ] **Step 2: Encabezado de grupo**
+- [x] **Step 2: Encabezado de grupo**
 
 ```python
     def _group_header(self, cat, n):
@@ -805,7 +805,7 @@ git commit -m "feat(ui): pestanas, toolbar de filtro y seleccion"
         )
 ```
 
-- [ ] **Step 3: Reconstruir la lista aplicando filtro y grupos**
+- [x] **Step 3: Reconstruir la lista aplicando filtro y grupos**
 
 ```python
     def rebuild_list(self):
@@ -844,7 +844,7 @@ git commit -m "feat(ui): pestanas, toolbar de filtro y seleccion"
         self._refresh_count()
 ```
 
-- [ ] **Step 4: La fila con ícono y franja**
+- [x] **Step 4: La fila con ícono y franja**
 
 Reemplazar el `ft.Container` que devuelve `_build_row` por:
 
@@ -878,7 +878,7 @@ Reemplazar el `ft.Container` que devuelve `_build_row` por:
         )
 ```
 
-- [ ] **Step 5: Pintar la franja en `_paint_row`**
+- [x] **Step 5: Pintar la franja en `_paint_row`**
 
 Agregar al principio de `_paint_row`, después de resolver `state`:
 
@@ -887,7 +887,7 @@ Agregar al principio de `_paint_row`, después de resolver `state`:
             pkg["ui_stripe"].bgcolor = self.STRIPE.get(state) or "transparent"
 ```
 
-- [ ] **Step 6: Probar a mano**
+- [x] **Step 6: Probar a mano**
 
 ```bash
 cd ps4-pkg-installer && python3 ps4_pkg_installer.py
@@ -895,7 +895,7 @@ cd ps4-pkg-installer && python3 ps4_pkg_installer.py
 
 Verificar contra la maqueta: grupos con su encabezado, íconos, título arriba y nombre de archivo abajo en gris, franja de color a la izquierda. Filtrar por `outfit` deja tres. El paquete sin ícono muestra el marcador de respaldo, no un hueco.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ps4-pkg-installer
@@ -914,7 +914,7 @@ git commit -m "feat(ui): filas con icono, grupos por categoria y franja de estad
 - Consumes: `rebuild_list` (Task 6)
 - Produces: `_tile(pkg) -> ft.Container`
 
-- [ ] **Step 1: Implementar el tile**
+- [x] **Step 1: Implementar el tile**
 
 ```python
     def _tile(self, pkg):
@@ -961,7 +961,7 @@ git commit -m "feat(ui): filas con icono, grupos por categoria y franja de estad
         )
 ```
 
-- [ ] **Step 2: Probar a mano**
+- [x] **Step 2: Probar a mano**
 
 ```bash
 cd ps4-pkg-installer && python3 ps4_pkg_installer.py
@@ -969,7 +969,7 @@ cd ps4-pkg-installer && python3 ps4_pkg_installer.py
 
 Verificar: el botón *Cuadrícula* cambia la vista, los tiles seleccionados quedan con borde azul y fondo tenue, un clic alterna la selección, y un paquete en curso no se deja alternar. *Todos* y *Ninguno* siguen funcionando en esta vista.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 cd ps4-pkg-installer
@@ -988,7 +988,7 @@ git commit -m "feat(ui): vista cuadricula con caratulas"
 - Consumes: `_progress_of` (ya existe)
 - Produces: nada
 
-- [ ] **Step 1: Fundir las líneas de rango en una sola**
+- [x] **Step 1: Fundir las líneas de rango en una sola**
 
 Hoy cada `Range` servido escribe su propia línea: docenas por paquete, todas casi iguales, y los mensajes que importan se ahogan. En `_on_download`, reemplazar el `self.log(f"La PS4 pide {rng} de {name}", "step")` por una línea que se emite como mucho una vez cada 15 segundos por paquete:
 
@@ -1005,17 +1005,17 @@ Hoy cada `Range` servido escribe su propia línea: docenas por paquete, todas ca
 
 Ese bloque va dentro del `for pkg in self.pkgs` que ya existe, después de actualizar `served_pos`. La línea suelta de antes se borra.
 
-- [ ] **Step 2: Verificar los tests que tocan `_on_download`**
+- [x] **Step 2: Verificar los tests que tocan `_on_download`**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/test_poll.py -v`
 Expected: PASS. Los tests de `served_pos` no miran el log, así que deben seguir en verde sin cambios.
 
-- [ ] **Step 3: Correr toda la batería**
+- [x] **Step 3: Correr toda la batería**
 
 Run: `cd ps4-pkg-installer && python3 -m pytest tests/ -q`
 Expected: PASS, sin regresiones.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cd ps4-pkg-installer
