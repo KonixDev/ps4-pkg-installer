@@ -1203,6 +1203,8 @@ class App:
         "error":       ("Error",       RED,    ft.Icons.ERROR_ROUNDED),
         "cancelled":   ("Cancelado",   MUTED,  ft.Icons.CANCEL_ROUNDED),
         "unknown":     ("Sin datos",   MUTED,  ft.Icons.HELP_OUTLINE_ROUNDED),
+        "waiting":     ("Esperando turno", MUTED, ft.Icons.HOURGLASS_EMPTY_ROUNDED),
+        "queued":      ("En cola, sin confirmar", AMBER, ft.Icons.PENDING_ROUNDED),
     }
 
     def _build_row(self, pkg):
@@ -1714,6 +1716,47 @@ class App:
 
         threading.Thread(target=self._install_worker, args=(ip, selected), daemon=True).start()
 
+    def _wait_for_console(self, ip, pkg):
+        """
+        Espera a que la consola vuelva a atender la API antes del próximo envío.
+
+        RPI sirve la API y los PKG con el mismo hilo: mientras descarga no
+        contesta /api. Mandarle el install igual no lo rechaza — lo encola y la
+        respuesta con el task_id nunca llega, así que queda una tarea que no se
+        puede seguir ni cancelar. Esperar el turno no alarga la descarga (el
+        ancho de banda es el mismo), solo conserva el control.
+
+        Devuelve True si la consola está lista, False si hay que abortar.
+        """
+        if self.ps4_state(ip, timeout=8) == "ok":
+            return True
+
+        pkg["state"] = "waiting"
+        self.refresh_rows()
+        self.log(f"{pkg['name']}: espero a que la consola se libere…", "step")
+
+        caidas = 0
+        while not self.stopping:
+            estado = self.ps4_state(ip, timeout=8)
+            if estado == "ok":
+                self.log(f"{pkg['name']}: la consola se liberó", "ok")
+                return True
+            if estado == "down":
+                # "busy" es una consola trabajando y se espera. "down" es que no
+                # hay nadie en el puerto; un pico aislado se tolera, tres no.
+                caidas += 1
+                if caidas >= 3:
+                    self.log(
+                        f"{pkg['name']}: la consola dejó de responder en {ip}. Corto el envío.",
+                        "error",
+                    )
+                    return False
+            else:
+                caidas = 0
+            time.sleep(POLL_MAX_BACKOFF)
+
+        return False
+
     def _install_worker(self, ip, packages):
         self.installing = True
         self.btn_install.disabled = True
@@ -1746,6 +1789,14 @@ class App:
                     break
 
                 name = pkg["name"]
+
+                # RPI no atiende /api mientras descarga. Mandar igual encola una
+                # tarea cuyo id nunca llega: queda huérfana, sin forma de
+                # seguirla ni cancelarla. Esperamos el turno.
+                if not self._wait_for_console(ip, pkg):
+                    self.log("Corto el envío. Los que faltan quedan sin enviar.", "warn")
+                    break
+
                 pkg["state"] = "sending"
                 pkg["error"] = ""
                 self.refresh_rows()
@@ -1774,10 +1825,17 @@ class App:
                 except urllib.error.HTTPError as e:
                     self._handle_install_reply(pkg, parse_rpi_json(e.read()))
                 except socket.timeout:
-                    pkg["state"] = "error"
-                    pkg["error"] = f"sin respuesta en {INSTALL_TIMEOUT}s"
-                    self.log(f"{name}: la consola no contestó en {INSTALL_TIMEOUT} s", "error")
-                    self.log("La app quedó procesando. Reiniciala en la consola.", "info")
+                    # No es un fallo: el pedido llegó y RPI lo procesa cuando
+                    # puede, así que la tarea casi seguro existe. Lo que se
+                    # perdió es el task_id, no el paquete.
+                    pkg["state"] = "queued"
+                    pkg["error"] = "la consola no confirmó; probablemente esté en cola"
+                    self.log(f"{name}: sin confirmación en {INSTALL_TIMEOUT} s", "warn")
+                    self.log(
+                        "Lo más probable es que igual haya quedado en cola. No cierres "
+                        "la app ni reinicies la consola: cortarías las descargas en curso.",
+                        "info",
+                    )
                 except urllib.error.URLError as e:
                     pkg["state"] = "error"
                     pkg["error"] = str(e.reason)
@@ -1792,10 +1850,16 @@ class App:
                 if i < total and not self.stopping:
                     time.sleep(3)
 
+            sin_confirmar = sum(1 for p in packages if p.get("state") == "queued")
             if ok_count == total:
                 self.log(f"{ok_count} de {total} en cola. Seguí el progreso acá arriba.", "ok")
-            elif ok_count:
-                self.log(f"{ok_count} de {total} aceptados, el resto falló.", "warn")
+            elif ok_count or sin_confirmar:
+                partes = []
+                if ok_count:
+                    partes.append(f"{ok_count} confirmado(s)")
+                if sin_confirmar:
+                    partes.append(f"{sin_confirmar} sin confirmar")
+                self.log(f"{' y '.join(partes)} de {total}.", "warn")
             else:
                 self.log("La consola rechazó todos los paquetes.", "error")
 
