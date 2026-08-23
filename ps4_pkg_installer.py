@@ -22,6 +22,8 @@ from pathlib import Path
 
 import flet as ft
 
+import archives
+
 # ---------------------------------------------------------------- paleta
 
 BG = "#0f1115"
@@ -37,6 +39,7 @@ AMBER = "#ffb454"
 
 PS4_PORT = 12800
 INSTALL_TIMEOUT = 150   # RPI baja header+entry table+sfo+icono dentro del mismo POST
+POLL_MAX_BACKOFF = 15   # tope de espera entre reintentos del poll
 MAX_DEPTH = 6           # niveles de subcarpetas a recorrer
 MAX_PKGS = 400          # tope para no colgarse si apuntan a un disco entero
 PKG_MAGIC = b"\x7fCNT"  # firma de todo PKG de PS4
@@ -292,7 +295,9 @@ class App:
         self.httpd = None
         self.port = None
         self.pkgs = []          # [{path, name, size, cb}]
+        self.archives = []      # comprimidos sin extraer en la carpeta
         self.installing = False
+        self.extracting = False
         self.scanning = False
 
         self.cfg = load_config()
@@ -504,6 +509,41 @@ class App:
             self.folder, size=13.5, color=TEXT, no_wrap=True, expand=True,
             overflow=ft.TextOverflow.ELLIPSIS,
         )
+        self.f_pass = ft.TextField(
+            label="Contraseña", password=True, can_reveal_password=True,
+            width=190, dense=True, border_color=BORDER, color=TEXT,
+        )
+        self.cb_delete_archives = ft.Checkbox(
+            label="borrar los comprimidos al terminar", value=False,
+            active_color=BLUE, label_style=ft.TextStyle(size=12, color=MUTED),
+        )
+        self.btn_extract = ft.ElevatedButton(
+            "Extraer", icon=ft.Icons.UNARCHIVE_ROUNDED, on_click=self.on_extract,
+        )
+        self.arch_text = ft.Text("", size=13, color=TEXT)
+        self.arch_bar = ft.ProgressBar(
+            value=0, color=BLUE, bgcolor=BORDER, height=4, border_radius=2, visible=False
+        )
+        self.arch_banner = ft.Container(
+            visible=False, padding=12, border_radius=10,
+            bgcolor=SURFACE_2, border=ft.border.all(1, BORDER),
+            content=ft.Column(spacing=8, controls=[
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Row(spacing=8, controls=[
+                            ft.Icon(ft.Icons.FOLDER_ZIP_OUTLINED, color=AMBER, size=18),
+                            self.arch_text,
+                        ]),
+                        ft.Row(spacing=8, controls=[self.f_pass, self.btn_extract]),
+                    ],
+                ),
+                self.cb_delete_archives,
+                self.arch_bar,
+            ]),
+        )
+
         self.pkg_list = ft.ListView(spacing=6, padding=6, expand=True)
         self.count_label = ft.Text("", size=12.5, color=MUTED)
 
@@ -546,6 +586,7 @@ class App:
                         ),
                     ),
                     self.manual_path,
+                    self.arch_banner,
                     ft.Container(
                         expand=True,
                         bgcolor=SURFACE_2,
@@ -1024,6 +1065,7 @@ class App:
                     "path": path, "name": name, "rel": rel, "sub": sub, "size": size,
                     "state": "idle", "task_id": None, "polling": False,
                     "served": 0, "transferred": 0, "length": 0, "rest_sec": 0,
+                    "served_pos": 0, "stale": False,
                 }
             pkg["cb"] = ft.Checkbox(
                 value=True, active_color=BLUE, on_change=lambda _: self._refresh_count()
@@ -1055,7 +1097,46 @@ class App:
             extra = f" en {subs} subcarpeta(s)" if subs else ""
             self.log(f"{len(found)} paquete(s) encontrado(s){extra}", "ok")
 
+        self._scan_archives()
         self._refresh_count()
+
+    def _scan_archives(self):
+        """Busca comprimidos sin extraer y muestra el banner si hay alguno."""
+        if self.extracting:
+            return
+        try:
+            self.archives = archives.find_archives(self.folder, max_depth=MAX_DEPTH)
+        except Exception as e:
+            self.archives = []
+            self.log(f"No pude revisar comprimidos: {e}", "warn")
+
+        if not self.archives:
+            self.arch_banner.visible = False
+            return
+
+        if not archives.seven_zip_path():
+            self.arch_banner.visible = False
+            self.log(
+                "Hay comprimidos sin extraer pero falta el binario de 7-Zip. "
+                "Corriendo desde fuente: brew install sevenzip", "warn"
+            )
+            return
+
+        total = sum(a.total_size for a in self.archives)
+        incompletos = [a for a in self.archives if a.missing_parts]
+
+        self.arch_text.value = (
+            f"{len(self.archives)} comprimido(s) sin extraer  ·  {human_size(total)}"
+        )
+        self.arch_banner.visible = True
+        self.btn_extract.disabled = bool(incompletos)
+
+        for a in incompletos:
+            self.log(
+                f"{a.name}: faltan volúmenes ({', '.join(a.missing_parts)})", "error"
+            )
+        if not incompletos:
+            self.log(f"{len(self.archives)} comprimido(s) sin extraer", "warn")
 
     def _walk_pkgs(self, root):
         """
@@ -1192,6 +1273,20 @@ class App:
         self._paint_row(pkg)
         return row
 
+    def _progress_of(self, pkg):
+        """
+        (bytes hechos, total) para pintar la barra.
+
+        Con datos frescos manda lo que reporta la consola. Cuando está muda
+        (stale), el servidor local es lo único que sabe algo — y sabe bastante:
+        el Range trae el byte exacto.
+        """
+        total = pkg.get("length") or pkg["size"]
+        done = pkg.get("transferred") or 0
+        if pkg.get("stale"):
+            done = max(done, pkg.get("served_pos", 0))
+        return done, total
+
     def _paint_row(self, pkg):
         state = pkg.get("state", "idle")
         label, color, icon = self.STATES.get(state, self.STATES["idle"])
@@ -1205,8 +1300,7 @@ class App:
         pkg["ui_resume"].visible = state == "paused"
         pkg["ui_stop"].visible = active
 
-        total = pkg.get("length") or pkg["size"]
-        done = pkg.get("transferred") or 0
+        done, total = self._progress_of(pkg)
         pct = (done / total) if total else 0
 
         if state == "done":
@@ -1221,9 +1315,12 @@ class App:
             bits = [f"{pct*100:.1f}%"]
             if total:
                 bits.append(f"{human_size(done)} de {human_size(total)}")
-            eta = human_eta(pkg.get("rest_sec"))
-            if eta and state == "downloading":
-                bits.append(f"faltan {eta}")
+            if pkg.get("stale"):
+                bits.append("avance medido en el servidor local")
+            else:
+                eta = human_eta(pkg.get("rest_sec"))
+                if eta and state == "downloading":
+                    bits.append(f"faltan {eta}")
             pkg["ui_detail"].value = "  ·  ".join(bits)
         elif state == "sending":
             pkg["ui_bar"].visible = True
@@ -1404,25 +1501,46 @@ class App:
             self.log(f"{name}: falló sin detalle ({res})", "error")
 
     def poll_task(self, pkg):
-        """Sigue una tarea en la consola hasta que termina o se cancela."""
+        """
+        Sigue una tarea en la consola hasta que termina o se cancela.
+
+        RPI sirve la API y el PKG con el mismo hilo: mientras hay una descarga
+        en curso, /api no contesta absolutamente nada (medido: 12 timeouts de
+        10s seguidos, cero respuestas, con la transferencia avanzando sin
+        problemas). Acá el silencio es lo NORMAL, no una tarea perdida.
+
+        Antes se apagaba el polling a los 3 fallos y el paquete quedaba en
+        "unknown": la fila se veía como si no se hubiera enviado nada, para
+        siempre y sin un mensaje que lo explicara. Ahora reintenta con backoff
+        y marca el paquete como "stale", así la UI puede seguir mostrando el
+        avance que reporta el servidor HTTP local (ver _on_download).
+        """
         tid = pkg["task_id"]
         stagnant = 0
         last_seen = -1
+        aviso_dado = False
 
         while pkg.get("polling") and not self.stopping:
             res = self.rpi_call("get_task_progress", {"task_id": tid}, timeout=10) or {}
 
             if str(res.get("status", "")).lower() != "success":
                 stagnant += 1
-                if stagnant >= 3:
-                    pkg["polling"] = False
-                    if pkg["state"] not in ("done", "cancelled"):
-                        pkg["state"] = "unknown"
-                    self.refresh_rows()
-                    return
-                time.sleep(2)
+                pkg["stale"] = True
+                if stagnant == 3 and not aviso_dado:
+                    aviso_dado = True
+                    self.log(
+                        f"{pkg['name']}: la consola no contesta la API mientras "
+                        f"descarga. Sigo el avance por el servidor local.", "warn"
+                    )
+                self.refresh_rows()
+                # Martillar una consola saturada no la despierta antes.
+                time.sleep(min(2 * stagnant, POLL_MAX_BACKOFF))
                 continue
+
+            if stagnant and aviso_dado:
+                self.log(f"{pkg['name']}: la consola volvió a contestar", "ok")
             stagnant = 0
+            pkg["stale"] = False
 
             total = res.get("length_total") or res.get("length") or pkg["size"]
             done = res.get("transferred_total") or res.get("transferred") or 0
@@ -1455,12 +1573,128 @@ class App:
             self.refresh_rows()
             time.sleep(2)
 
+    _RE_RANGE_START = re.compile(r"bytes=(\d+)-")
+
     def _on_download(self, path, rng=None):
-        name = urllib.parse.unquote(os.path.basename(path)) or path
-        if rng:
-            self.log(f"La PS4 pide {rng} de {name}", "step")
-        else:
+        """
+        Cada pedido que atiende el servidor local.
+
+        Además de loguear, de acá sale el progreso de verdad: el header Range
+        dice en qué byte va la consola. Es la única fuente que sigue viva
+        durante la transferencia — la API de RPI queda muda mientras descarga,
+        así que sin esto la barra no se movería nunca.
+        """
+        clean = urllib.parse.unquote(path.split("?", 1)[0])
+        name = os.path.basename(clean) or path
+
+        if not rng:
             self.log(f"La PS4 está descargando {name}", "step")
+            return
+
+        self.log(f"La PS4 pide {rng} de {name}", "step")
+
+        m = self._RE_RANGE_START.match(rng.strip())
+        if not m:
+            return
+        start = int(m.group(1))
+
+        for pkg in self.pkgs:
+            if pkg["name"] != name:
+                continue
+            # La consola pide rangos fuera de orden (header, sfo, icono):
+            # nos quedamos con la marca más alta alcanzada, nunca retrocede.
+            if start > pkg.get("served_pos", 0):
+                pkg["served_pos"] = start
+                self.refresh_rows()
+            break
+
+    # ------------------------------------------------------------ extracción
+
+    def on_extract(self, _):
+        if self.extracting or not self.archives:
+            return
+        self.extracting = True
+        self.btn_extract.disabled = True
+        self.arch_bar.visible = True
+        self.arch_bar.value = None
+        self._safe_update()
+        threading.Thread(target=self._extract_worker, daemon=True).start()
+
+    def _extract_worker(self):
+        """
+        Extrae la tanda entera. Corre en thread aparte: 70 GB de escritura no
+        pueden bloquear la ventana ni el servidor que le sirve a la consola.
+        """
+        pwd = (self.f_pass.value or "").strip()
+        borrar = self.cb_delete_archives.value
+        pendientes = list(self.archives)
+        hechos = 0
+
+        try:
+            # Medimos todo antes de escribir un byte: mejor frenar ahora que
+            # quedarse sin disco a los 40 GB y dejar un .pkg corrupto.
+            necesario = 0
+            for a in pendientes:
+                try:
+                    necesario += archives.inspect_archive(a, pwd).unpacked_size
+                except archives.WrongPassword:
+                    self.log(f"{a.name}: contraseña incorrecta", "error")
+                    return
+                except Exception as e:
+                    self.log(f"{a.name}: no pude leerlo ({e})", "error")
+                    return
+
+            alcanza, libre = archives.check_space(self.folder, necesario)
+            if not alcanza:
+                self.log(
+                    f"No hay espacio: hacen falta {human_size(necesario)} y "
+                    f"quedan {human_size(libre)} libres", "error",
+                )
+                return
+
+            self.log(
+                f"Extrayendo {len(pendientes)} comprimido(s) · "
+                f"{human_size(necesario)} al terminar", "step",
+            )
+
+            for idx, a in enumerate(pendientes, 1):
+                dest = os.path.join(os.path.dirname(a.path), a.name)
+
+                def progreso(pct, nombre=a.name, i=idx, n=len(pendientes)):
+                    self.arch_bar.value = ((i - 1) + pct) / n
+                    self.arch_text.value = f"Extrayendo {nombre}  ·  {pct * 100:.0f}%  ({i}/{n})"
+                    self._safe_update()
+
+                try:
+                    archives.extract(a, dest, pwd, on_progress=progreso)
+                except archives.WrongPassword:
+                    self.log(f"{a.name}: contraseña incorrecta", "error")
+                    return
+                except Exception as e:
+                    self.log(f"{a.name}: falló la extracción ({e})", "error")
+                    return
+
+                hechos += 1
+                self.log(f"{a.name}: extraído", "ok")
+
+                if borrar:
+                    for parte in a.parts:
+                        try:
+                            os.remove(parte)
+                        except OSError as e:
+                            self.log(
+                                f"No pude borrar {os.path.basename(parte)}: {e}", "warn"
+                            )
+
+        finally:
+            self.extracting = False
+            self.arch_bar.visible = False
+            self.btn_extract.disabled = False
+            if hechos:
+                self.log(f"{hechos} comprimido(s) extraído(s)", "ok")
+            # Re-escanear: los .pkg nuevos entran solos a la lista de siempre.
+            self.scan_folder()
+            self._safe_update()
 
     # ------------------------------------------------------------ instalación
 

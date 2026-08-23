@@ -110,7 +110,11 @@ pyinstaller --onefile --windowed --name "PS4 PKG Installer" \
 - `Server :8000` — the local file server. It starts by itself; there is no button. If the port is taken it tries the next ones and tells you which it settled on.
 - `PS4 ready` — the console. See below.
 
-**4. Tick the packages you want and press Install.**
+**4. Got compressed releases?** If the folder holds `.rar`, `.zip` or `.7z` files, a banner shows up above the list with how many there are and how big they are. Type the password if the release needs one and hit *Extraer*: once it finishes, the `.pkg` files land in the list below on their own.
+
+Multi-volume releases (`.part1.rar`, `.part2.rar`, …) count as a single entry — just keep every part in the same folder. If one is missing, the button stays disabled and the log names it. Free space is checked before writing a single byte, so a short disk stops the run instead of leaving a half-written `.pkg`. Deleting the archives afterwards is an opt-in checkbox, off by default.
+
+**5. Tick the packages you want and press Install.**
 
 Each row then shows its own state, progress bar, percentage, bytes transferred and ETA, with pause and cancel buttons. The console downloads several packages at once, so several rows advance together.
 
@@ -137,6 +141,10 @@ A plain TCP connect check reports "connected" against a completely dead app. Thi
 `/api/install` returns a `task_id`. With it, the tool polls `/api/get_task_progress` for the console's own view of the transfer — bytes moved, remaining seconds, unpacking percentage — which is why the phases read *Preparing → Downloading → Installing* rather than one undifferentiated bar. *Installing* is `local_copy_percent`: the console unpacking after the bytes have arrived.
 
 The same `task_id` drives `/api/pause_task`, `/api/resume_task` and `/api/stop_task`, which is where the per-row buttons and *Cancel all* come from.
+
+**When the console goes quiet.** RPI serves the API and the PKG from the same thread, so while a large transfer is running `/api/get_task_progress` stops answering entirely — measured: twelve consecutive ten-second timeouts, zero replies, with the download moving along fine. Silence here is normal, not a lost task.
+
+That is why progress has two sources. While the console answers, it wins. When it goes quiet, the bar switches to what the local HTTP server sees: every `Range` the PS4 requests carries the exact byte it has reached, and that source cannot saturate because it is your own machine. The row says *avance medido en el servidor local* and hides the ETA, which would be stale by then.
 
 **One caveat:** RPI's responses are not valid JSON. It writes integers as hex literals:
 
