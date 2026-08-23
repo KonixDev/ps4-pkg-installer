@@ -46,13 +46,42 @@ jobs:
           # "ModuleNotFoundError: No module named 'flet_desktop'".
           python -c "import flet_desktop, os; print('flet_desktop OK:', os.path.dirname(flet_desktop.__file__))"
 
+      - name: Fetch the 7-Zip CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vendor
+          case "${{ runner.os }}" in
+            macOS)
+              curl -fsSL https://www.7-zip.org/a/7z2408-mac.tar.xz -o 7z.tar.xz
+              tar -xf 7z.tar.xz 7zz && mv 7zz vendor/7zz && chmod +x vendor/7zz
+              ;;
+            Linux)
+              curl -fsSL https://www.7-zip.org/a/7z2408-linux-x64.tar.xz -o 7z.tar.xz
+              tar -xf 7z.tar.xz 7zz && mv 7zz vendor/7zz && chmod +x vendor/7zz
+              ;;
+            Windows)
+              curl -fsSL https://www.7-zip.org/a/7z2408-extra.7z -o 7z.7z
+              7z x 7z.7z -ovendor 7za.exe
+              ;;
+          esac
+          ls -l vendor/
+
       - name: Build
-        run: >
-          pyinstaller --noconfirm --onefile --windowed
-          --name "PS4 PKG Installer"
-          --collect-all flet
-          --collect-all flet_desktop
-          ps4_pkg_installer.py
+        shell: bash
+        run: |
+          # El separador de --add-binary es ';' en Windows y ':' en el resto.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            SEP=";"; SEVENZIP="vendor/7za.exe"
+          else
+            SEP=":"; SEVENZIP="vendor/7zz"
+          fi
+          pyinstaller --noconfirm --onefile --windowed \
+            --name "PS4 PKG Installer" \
+            --collect-all flet \
+            --collect-all flet_desktop \
+            --add-binary "${SEVENZIP}${SEP}." \
+            ps4_pkg_installer.py
 
       - name: Verify the runtime got bundled
         shell: bash
