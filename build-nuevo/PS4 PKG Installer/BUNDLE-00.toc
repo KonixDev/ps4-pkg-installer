@@ -1,0 +1,4 @@
+([('PS4 PKG Installer',
+   '/Users/cellcaribe/Downloads/PS4/ps4-pkg-installer/dist-nuevo/PS4 PKG '
+   'Installer',
+   'EXECUTABLE')],)

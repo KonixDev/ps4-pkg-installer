@@ -819,40 +819,64 @@ class App:
         )
 
         # --- raíz: dos pestañas, la lista se queda con la ventana ---
-        self.tabs = ft.Tabs(
-            selected_index=0,
+        # Hechas a mano y no con ft.Tabs: en Flet 0.28.3, Tab.before_update
+        # hace isinstance(icon, IconValue) y IconValue es un Union, cosa que
+        # Python 3.9 —el que trae macOS— no admite. Con ft.Tabs la ventana ni
+        # llega a montarse. Dos botones y un par de "visible" hacen lo mismo.
+        self.panel_install = ft.Container(
             expand=True,
-            animation_duration=160,
-            indicator_color=BLUE,
-            label_color=TEXT,
-            unselected_label_color=MUTED,
-            divider_color=BORDER,
-            tabs=[
-                ft.Tab(
-                    text="Instalar",
-                    content=ft.Container(
-                        padding=ft.padding.only(20, 14, 20, 14),
-                        content=ft.Column(
-                            spacing=12, expand=True, controls=[card2, action_bar]
-                        ),
-                    ),
-                ),
-                ft.Tab(
-                    text="Registro",
-                    content=ft.Container(
-                        padding=ft.padding.only(20, 14, 20, 14), content=console
-                    ),
-                ),
-            ],
+            padding=ft.padding.only(20, 14, 20, 14),
+            content=ft.Column(spacing=12, expand=True, controls=[card2, action_bar]),
+        )
+        self.panel_log = ft.Container(
+            expand=True,
+            visible=False,
+            padding=ft.padding.only(20, 14, 20, 14),
+            content=console,
+        )
+        self.tab_index = 0
+        self.tab_buttons = [self._tab_button("Instalar", 0),
+                            self._tab_button("Registro", 1)]
+
+        tabbar = ft.Container(
+            border=ft.border.only(bottom=ft.BorderSide(1, BORDER)),
+            padding=ft.padding.only(14, 0, 14, 0),
+            content=ft.Row(spacing=2, controls=self.tab_buttons),
         )
 
         self.root = ft.Container(
             expand=True,
             bgcolor=BG,
             content=ft.Column(
-                spacing=0, expand=True, controls=[header, self.tabs],
+                spacing=0,
+                expand=True,
+                controls=[header, tabbar, self.panel_install, self.panel_log],
             ),
         )
+
+    def _tab_button(self, label, idx):
+        """Pestaña: subrayado azul cuando está activa, gris cuando no."""
+        activo = idx == 0
+        return ft.Container(
+            padding=ft.padding.only(15, 13, 15, 11),
+            border=ft.border.only(
+                bottom=ft.BorderSide(2, BLUE if activo else "transparent")),
+            content=ft.Text(label, size=13.5, weight=ft.FontWeight.W_500,
+                            color=TEXT if activo else MUTED),
+            on_click=lambda _, i=idx: self.on_tab(i),
+            ink=True,
+        )
+
+    def on_tab(self, idx):
+        self.tab_index = idx
+        for i, btn in enumerate(self.tab_buttons):
+            activo = i == idx
+            btn.content.color = TEXT if activo else MUTED
+            btn.border = ft.border.only(
+                bottom=ft.BorderSide(2, BLUE if activo else "transparent"))
+        self.panel_install.visible = idx == 0
+        self.panel_log.visible = idx == 1
+        self._safe_update()
 
     # ------------------------------------------------------------ log
 
