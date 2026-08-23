@@ -114,6 +114,8 @@ pyinstaller --onefile --windowed --name "PS4 PKG Installer" \
 
 Los releases partidos en volúmenes (`.part1.rar`, `.part2.rar`, …) se listan como una sola entrada — alcanza con tener todas las partes en la misma carpeta. Si falta alguna, el botón queda deshabilitado y el log dice cuál. Antes de empezar se calcula el espacio necesario: si no entra, avisa en vez de dejar un `.pkg` a medias. La casilla *borrar los comprimidos al terminar* viene apagada.
 
+Adentro hay dos extractores. El que hace el trabajo es 7-Zip, que viaja bundleado; pero 7-Zip lee los headers de cualquier RAR5 y no implementa todos los codecs de compresión, así que con un RAR comprimido de verdad lista el contenido perfecto y muere recién al descomprimir, con `Unsupported Method`. Cuando eso pasa se reintenta con `unar` (o `unrar`, si lo tenés), que también va bundleado. La mayoría de los releases usan RAR en modo *store* — un PKG ya viene comprimido y cifrado, volver a comprimirlo no achica nada — pero cuando aparece uno comprimido, sin el segundo motor no hay forma de abrirlo.
+
 **5. Tildá los paquetes que quieras y tocá Instalar.**
 
 Cada fila pasa a mostrar su propio estado, barra de progreso, porcentaje, bytes transferidos y tiempo restante, con botones de pausa y cancelación. La consola baja varios paquetes a la vez, así que vas a ver varias filas avanzando juntas.

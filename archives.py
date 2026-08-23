@@ -28,6 +28,33 @@ _RE_NUM_VOL = re.compile(r"^(?P<stem>.+\.(?:7z|zip|rar))\.(?P<num>\d{3})$", re.I
 
 _SINGLE_EXT = (".rar", ".zip", ".7z")
 
+# Una .app abierta desde Finder hereda un PATH mínimo que no incluye los
+# directorios de Homebrew, así que which() sola no alcanza.
+_EXTRA_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
+
+
+def _find_binary(names):
+    """Primero el bundleado, después el PATH, después las rutas conocidas."""
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        for name in names:
+            cand = os.path.join(bundled, name)
+            if os.path.exists(cand):
+                return cand
+
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+
+    for directory in _EXTRA_DIRS:
+        for name in names:
+            cand = os.path.join(directory, name)
+            if os.path.exists(cand):
+                return cand
+
+    return None
+
 
 class SevenZipMissing(Exception):
     """No hay binario de 7-Zip disponible ni bundleado ni en el sistema."""
@@ -51,20 +78,7 @@ def seven_zip_path():
     nada instalado), después el del sistema (útil corriendo desde fuente).
     """
     names = ["7za.exe", "7z.exe"] if os.name == "nt" else ["7zz", "7za", "7z"]
-
-    bundled = getattr(sys, "_MEIPASS", None)
-    if bundled:
-        for name in names:
-            cand = os.path.join(bundled, name)
-            if os.path.exists(cand):
-                return cand
-
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            return found
-
-    return None
+    return _find_binary(names)
 
 
 def _classify(filename):
@@ -170,6 +184,17 @@ class WrongPassword(Exception):
     """7-Zip rechazó la contraseña (o hacía falta una y no se dio)."""
 
 
+class UnsupportedMethod(Exception):
+    """
+    El extractor lee el índice pero no implementa el codec del archivo.
+
+    Pasa con RAR5 comprimido (-m3 y parientes): 7-Zip inventaria el contenido
+    perfecto y muere recién al descomprimir. Los releases de PS4 suelen venir
+    en -m0 (store), donde el RAR es apenas un contenedor y no se nota — hasta
+    que aparece uno comprimido de verdad.
+    """
+
+
 @dataclass
 class ArchiveInfo:
     unpacked_size: int = 0
@@ -180,6 +205,35 @@ class ArchiveInfo:
 def _is_password_error(output):
     low = output.lower()
     return "wrong password" in low or "cannot open encrypted archive" in low
+
+
+def _is_unsupported_method(output):
+    low = output.lower()
+    return "unsupported method" in low or "unsupported compression" in low
+
+
+def fallback_extractor_path():
+    """
+    Extractor de respaldo para lo que 7-Zip no puede abrir.
+
+    unrar es el de RARLAB y soporta todo formato RAR; unar (The Unarchiver)
+    es la alternativa libre y alcanza para los mismos casos. Cualquiera de los
+    dos sirve, se usa el primero que aparezca.
+    """
+    names = ["unrar.exe", "unar.exe"] if os.name == "nt" else ["unrar", "unar"]
+    return _find_binary(names)
+
+
+def _fallback_cmd(exe, archive_path, dest, password):
+    """Comando del extractor de respaldo. Los dos tienen CLIs distintas."""
+    base = os.path.basename(exe).lower()
+    if base.startswith("unar"):
+        # -D evita que cree otra carpeta contenedora, -f pisa sin preguntar.
+        return [exe, "-p", password or "", "-D", "-f", "-o", dest, archive_path]
+    # unrar de RARLAB: "x" extrae con rutas. -p- es "no hay contraseña": sin
+    # eso se queda esperando teclado y el proceso nunca termina.
+    return [exe, "x", f"-p{password}" if password else "-p-", "-y",
+            archive_path, dest + os.sep]
 
 
 def _run_7z(args, password):
@@ -245,12 +299,10 @@ def inspect_archive(archive, password=""):
 _RE_PCT = re.compile(r"(\d{1,3})%")
 
 
-def extract(archive, dest, password="", on_progress=None):
+def _extract_with_7z(archive, dest, password, on_progress):
     """
-    Extrae `archive` en `dest` informando avance.
-
-    Se le pasa SOLO el primer volumen: 7-Zip encuentra el resto por su cuenta.
-    `-bsp1` manda el porcentaje a stdout, que es de dónde sale la barra.
+    Extrae con 7-Zip. Se le pasa SOLO el primer volumen: encuentra el resto
+    por su cuenta. `-bsp1` manda el porcentaje a stdout, de donde sale la barra.
     """
     exe = seven_zip_path()
     if not exe:
@@ -283,6 +335,8 @@ def extract(archive, dest, password="", on_progress=None):
 
     if _is_password_error(out):
         raise WrongPassword(archive.name)
+    if _is_unsupported_method(out):
+        raise UnsupportedMethod(archive.name)
     if proc.returncode != 0:
         raise RuntimeError(f"7-Zip falló extrayendo {archive.name}: {out.strip()[:400]}")
 
@@ -290,6 +344,75 @@ def extract(archive, dest, password="", on_progress=None):
         on_progress(1.0)
 
     return dest
+
+
+def _extract_with_fallback(archive, dest, password, on_progress):
+    """
+    Extrae con unrar o unar, para lo que 7-Zip no puede.
+
+    unrar reporta porcentaje y se parsea igual que 7-Zip. unar solo imprime una
+    línea por archivo terminado, así que ahí la barra se queda indeterminada
+    hasta el final: es el precio de que el archivo se pueda abrir.
+    """
+    exe = fallback_extractor_path()
+    if not exe:
+        raise UnsupportedMethod(archive.name)
+
+    os.makedirs(dest, exist_ok=True)
+    proc = subprocess.Popen(
+        _fallback_cmd(exe, archive.path, dest, password),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace", bufsize=1,
+        creationflags=_NO_WINDOW,
+    )
+
+    tail, last = [], -1.0
+    for chunk in iter(lambda: proc.stdout.read(256), ""):
+        tail.append(chunk)
+        if len(tail) > 40:
+            del tail[0]
+        if on_progress:
+            for m in _RE_PCT.finditer(chunk):
+                pct = min(100, int(m.group(1))) / 100.0
+                if pct > last:
+                    last = pct
+                    on_progress(pct)
+
+    proc.wait()
+    out = "".join(tail)
+
+    if _is_password_error(out) or "password" in out.lower() and "incorrect" in out.lower():
+        raise WrongPassword(archive.name)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{os.path.basename(exe)} falló extrayendo {archive.name}: {out.strip()[:400]}"
+        )
+
+    if on_progress and last < 1.0:
+        on_progress(1.0)
+
+    return dest
+
+
+def extract(archive, dest, password="", on_progress=None):
+    """
+    Extrae `archive` en `dest` informando avance.
+
+    Intenta primero con 7-Zip, que es el que viaja bundleado. Si el archivo usa
+    un codec que no implementa —RAR5 comprimido, típicamente— reintenta con
+    unrar o unar. Una contraseña incorrecta no se reintenta: cambiar de
+    extractor no la arregla.
+    """
+    os.makedirs(dest, exist_ok=True)
+    try:
+        return _extract_with_7z(archive, dest, password, on_progress)
+    except UnsupportedMethod:
+        if not fallback_extractor_path():
+            raise UnsupportedMethod(
+                f"{archive.name} usa un codec de compresión que 7-Zip no soporta. "
+                f"Hace falta unrar (o unar) instalado para abrirlo."
+            )
+        return _extract_with_fallback(archive, dest, password, on_progress)
 
 
 def check_space(dest, needed, margin=2 * 1024 ** 3):

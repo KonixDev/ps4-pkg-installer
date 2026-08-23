@@ -114,6 +114,8 @@ pyinstaller --onefile --windowed --name "PS4 PKG Installer" \
 
 Multi-volume releases (`.part1.rar`, `.part2.rar`, …) count as a single entry — just keep every part in the same folder. If one is missing, the button stays disabled and the log names it. Free space is checked before writing a single byte, so a short disk stops the run instead of leaving a half-written `.pkg`. Deleting the archives afterwards is an opt-in checkbox, off by default.
 
+There are two extractors inside. 7-Zip does the work and ships bundled, but it reads the headers of any RAR5 without implementing every compression codec: hand it a genuinely compressed RAR and it lists the contents perfectly, then dies on extraction with `Unsupported Method`. When that happens the run retries with `unar` (or `unrar`, if you have it), bundled as well. Most releases use RAR in *store* mode — a PKG is already compressed and encrypted, so recompressing buys nothing — but when a compressed one shows up, there is no opening it without the second engine.
+
 **5. Tick the packages you want and press Install.**
 
 Each row then shows its own state, progress bar, percentage, bytes transferred and ETA, with pause and cancel buttons. The console downloads several packages at once, so several rows advance together.

@@ -67,20 +67,58 @@ jobs:
           esac
           ls -l vendor/
 
+      - name: Fetch a fallback RAR extractor
+        shell: bash
+        continue-on-error: true
+        run: |
+          # 7-Zip lee los headers de cualquier RAR5 pero no implementa todos
+          # los codecs: con un RAR comprimido ("-m3") lista bien el contenido y
+          # muere al extraer con "Unsupported Method". unar/unrar sí pueden.
+          # Si este paso falla el build sigue: el ejecutable queda sin respaldo
+          # y esos archivos dan un error explicativo en vez de romper todo.
+          set -eu
+          mkdir -p vendor
+          case "${{ runner.os }}" in
+            macOS)
+              brew install unar
+              cp "$(brew --prefix)/bin/unar" vendor/unar
+              ;;
+            Linux)
+              sudo apt-get update -qq && sudo apt-get install -y unar
+              cp "$(command -v unar)" vendor/unar
+              ;;
+            Windows)
+              # RARLAB no publica un zip pelado del unrar de Windows: viene
+              # dentro del instalador autoextraíble, que 7-Zip sabe abrir.
+              curl -fsSL https://www.rarlab.com/rar/unrarw64.exe -o unrarw64.exe
+              7z x unrarw64.exe -ovendor UnRAR.exe
+              mv vendor/UnRAR.exe vendor/unrar.exe
+              ;;
+          esac
+          ls -l vendor/
+
       - name: Build
         shell: bash
         run: |
           # El separador de --add-binary es ';' en Windows y ':' en el resto.
           if [ "${{ runner.os }}" = "Windows" ]; then
-            SEP=";"; SEVENZIP="vendor/7za.exe"
+            SEP=";"; SEVENZIP="vendor/7za.exe"; FALLBACK="vendor/unrar.exe"
           else
-            SEP=":"; SEVENZIP="vendor/7zz"
+            SEP=":"; SEVENZIP="vendor/7zz"; FALLBACK="vendor/unar"
+          fi
+          EXTRA=""
+          # El respaldo es opcional: si su descarga falló, se compila sin él.
+          if [ -f "$FALLBACK" ]; then
+            EXTRA="--add-binary ${FALLBACK}${SEP}."
+          else
+            echo "::warning::Sin extractor de respaldo: los RAR comprimidos no se van a poder abrir."
           fi
           pyinstaller --noconfirm --onefile --windowed \
             --name "PS4 PKG Installer" \
             --collect-all flet \
             --collect-all flet_desktop \
             --add-binary "${SEVENZIP}${SEP}." \
+            $EXTRA \
             ps4_pkg_installer.py
 
       - name: Verify the runtime got bundled

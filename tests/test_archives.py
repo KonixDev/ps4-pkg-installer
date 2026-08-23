@@ -213,3 +213,129 @@ def test_check_space_pasa_con_un_archivo_chico(tmp_path):
     ok, _ = archives.check_space(str(tmp_path), needed=1024, margin=0)
 
     assert ok is True
+
+
+# ---------------------------------------------------------- motor de respaldo
+# 7-Zip lee los headers de cualquier RAR5 pero no implementa todos los codecs
+# de compresión: con un RAR "-m3" lista bien el contenido y muere al extraer
+# con "Unsupported Method". Verificado contra un DLC pack real de HITMAN.
+# Como no existe compresor RAR libre, no se puede generar un fixture así en el
+# test: lo que se verifica acá es la lógica de conmutación y los comandos.
+
+def test_fallback_path_encuentra_un_extractor():
+    # unar (The Unarchiver) o unrar (RARLAB); en esta máquina hay unar.
+    p = archives.fallback_extractor_path()
+    assert p is not None
+    assert os.path.exists(p)
+
+
+def test_comando_de_unar_bien_armado():
+    cmd = archives._fallback_cmd("/usr/bin/unar", "/x/a.part1.rar", "/dest", "hako")
+
+    assert cmd[0] == "/usr/bin/unar"
+    assert "-D" in cmd            # no crear carpeta contenedora extra
+    assert "-f" in cmd            # pisar sin preguntar
+    assert cmd[cmd.index("-o") + 1] == "/dest"
+    assert cmd[-1] == "/x/a.part1.rar"
+    assert "hako" in cmd
+
+
+def test_comando_de_unrar_bien_armado():
+    cmd = archives._fallback_cmd("/usr/bin/unrar", "/x/a.part1.rar", "/dest", "hako")
+
+    assert cmd[:2] == ["/usr/bin/unrar", "x"]
+    assert "-phako" in cmd
+    assert "-y" in cmd
+
+
+def test_comando_de_unrar_sin_password():
+    # -p- le dice a unrar que no hay contraseña; sin eso se queda esperando.
+    cmd = archives._fallback_cmd("/usr/bin/unrar", "/x/a.rar", "/dest", "")
+
+    assert "-p-" in cmd
+
+
+def test_detecta_el_codec_no_soportado():
+    salida = "ERROR: Unsupported Method : Hitman.DLCs/HITMAN.Bonus.pkg\n  0% - Hitman"
+
+    assert archives._is_unsupported_method(salida) is True
+    assert archives._is_unsupported_method("ERROR: Wrong password") is False
+
+
+def test_extract_cae_al_fallback_cuando_7zip_no_puede(tmp_path, monkeypatch):
+    """El caso HITMAN: 7-Zip se rinde y el respaldo termina el trabajo."""
+    arc = archives.Archive(path=str(tmp_path / "a.rar"), name="a")
+    llamados = []
+
+    def fake_7z(archive, dest, password, on_progress):
+        llamados.append("7z")
+        raise archives.UnsupportedMethod("m3")
+
+    def fake_fb(archive, dest, password, on_progress):
+        llamados.append("fallback")
+        return dest
+
+    monkeypatch.setattr(archives, "_extract_with_7z", fake_7z)
+    monkeypatch.setattr(archives, "_extract_with_fallback", fake_fb)
+
+    archives.extract(arc, str(tmp_path / "out"))
+
+    assert llamados == ["7z", "fallback"]
+
+
+def test_extract_no_usa_el_fallback_si_7zip_pudo(tmp_path, monkeypatch):
+    arc = archives.Archive(path=str(tmp_path / "a.7z"), name="a")
+    llamados = []
+
+    monkeypatch.setattr(archives, "_extract_with_7z",
+                        lambda a, d, p, o: llamados.append("7z") or d)
+    monkeypatch.setattr(archives, "_extract_with_fallback",
+                        lambda a, d, p, o: llamados.append("fallback") or d)
+
+    archives.extract(arc, str(tmp_path / "out"))
+
+    assert llamados == ["7z"]
+
+
+def test_sin_fallback_disponible_el_error_es_claro(tmp_path, monkeypatch):
+    arc = archives.Archive(path=str(tmp_path / "a.rar"), name="a")
+    monkeypatch.setattr(archives, "_extract_with_7z",
+                        lambda a, d, p, o: (_ for _ in ()).throw(archives.UnsupportedMethod("m3")))
+    monkeypatch.setattr(archives, "fallback_extractor_path", lambda: None)
+
+    with pytest.raises(archives.UnsupportedMethod) as e:
+        archives.extract(arc, str(tmp_path / "out"))
+
+    assert "unrar" in str(e.value).lower()
+
+
+def test_password_incorrecta_no_dispara_el_fallback(tmp_path, monkeypatch):
+    """Una contraseña mala no se arregla cambiando de extractor."""
+    arc = archives.Archive(path=str(tmp_path / "a.rar"), name="a")
+    llamados = []
+
+    def fake_7z(a, d, p, o):
+        llamados.append("7z")
+        raise archives.WrongPassword("a")
+
+    monkeypatch.setattr(archives, "_extract_with_7z", fake_7z)
+    monkeypatch.setattr(archives, "_extract_with_fallback",
+                        lambda a, d, p, o: llamados.append("fallback") or d)
+
+    with pytest.raises(archives.WrongPassword):
+        archives.extract(arc, str(tmp_path / "out"))
+
+    assert llamados == ["7z"]
+
+
+def test_busca_en_rutas_conocidas_sin_PATH(monkeypatch):
+    """
+    Una .app abierta desde Finder hereda un PATH mínimo, sin /opt/homebrew/bin.
+    Sin esto, la app compilada no encontraría nada aunque esté instalado.
+    """
+    monkeypatch.setattr(archives.shutil, "which", lambda n: None)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+
+    # En esta máquina 7zz está en Homebrew; con which() anulado, tiene que
+    # encontrarlo igual por ruta conocida.
+    assert archives.seven_zip_path() is not None
