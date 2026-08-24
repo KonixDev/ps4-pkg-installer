@@ -358,11 +358,20 @@ class PkgHandler(SimpleHTTPRequestHandler):
 
 
 class App:
+    # Un paquete en cualquiera de estos ya está en juego: volver a encolarlo
+    # sería mandarlo dos veces.
+    EN_JUEGO = frozenset({
+        "pending", "sending", "waiting", "queued",
+        "preparing", "downloading", "installing", "paused",
+    })
+
     def __init__(self, page: ft.Page):
         self.page = page
         self.httpd = None
         self.port = None
         self.pkgs = []          # [{path, name, size, cb}]
+        self.queue = []         # paquetes esperando su turno de envío
+        self.queue_lock = threading.Lock()
         self.archives = []      # comprimidos sin extraer en la carpeta
         self.installing = False
         self.extracting = False
@@ -1513,6 +1522,7 @@ class App:
         "unknown":     ("Sin datos",   MUTED,  ft.Icons.HELP_OUTLINE_ROUNDED),
         "waiting":     ("Esperando turno", MUTED, ft.Icons.HOURGLASS_EMPTY_ROUNDED),
         "queued":      ("En cola, sin confirmar", AMBER, ft.Icons.PENDING_ROUNDED),
+        "pending":     ("En la cola",  MUTED,  ft.Icons.LIST_ALT_ROUNDED),
     }
 
     # La franja izquierda repite el estado en forma además de en texto: con
@@ -1697,6 +1707,58 @@ class App:
 
 
     # ------------------------------------------------------------ servidor
+
+    def _enqueue(self, pkgs):
+        """
+        Suma a la cola los que todavía no están en juego. Devuelve los que
+        entraron de verdad.
+
+        El dedup es por identidad del dict, no por nombre: dos volcados del
+        mismo juego en subcarpetas distintas se llaman igual y son paquetes
+        distintos.
+        """
+        agregados = []
+        with self.queue_lock:
+            for pkg in pkgs:
+                if pkg.get("state") in self.EN_JUEGO:
+                    continue
+                if any(p is pkg for p in self.queue):
+                    continue
+                pkg["state"] = "pending"
+                self.queue.append(pkg)
+                agregados.append(pkg)
+        return agregados
+
+    def _dequeue(self):
+        with self.queue_lock:
+            return self.queue.pop(0) if self.queue else None
+
+    def _claim_worker(self):
+        """
+        ¿Le toca a este hilo arrancar el worker? Si sí, queda reservado.
+
+        `installing` sólo se toca bajo el lock de la cola. Es lo que garantiza
+        que nunca haya dos workers: dos POST /api/install a la vez le dejan a
+        RPI una tarea sin task_id, imposible de seguir o cancelar.
+        """
+        with self.queue_lock:
+            if self.installing:
+                return False
+            self.installing = True
+            return True
+
+    def _drain_queue(self):
+        """Vacía la cola y devuelve lo que había."""
+        with self.queue_lock:
+            resto, self.queue = self.queue, []
+        return resto
+
+    def set_install_button(self, en_cola):
+        """Con un envío vivo el botón suma a la cola en vez de quedar gris."""
+        icono, texto = self.btn_install.content.controls
+        icono.name = ft.Icons.PLAYLIST_ADD_ROUNDED if en_cola else ft.Icons.DOWNLOAD_ROUNDED
+        texto.value = "Agregar a la cola" if en_cola else "Instalar en la PS4"
+        self.btn_install.disabled = self.httpd is None
 
     def _publish(self, pkg):
         """
@@ -2057,9 +2119,6 @@ class App:
     # ------------------------------------------------------------ instalación
 
     def on_install(self, _):
-        if self.installing:
-            return
-
         ip = (self.f_ps4.value or "").strip()
         if not ip:
             self.log("Falta la IP de la PS4", "error")
@@ -2076,7 +2135,24 @@ class App:
                 self.log(f"Ninguno de los {len(self.pkgs)} paquetes está tildado", "warn")
             return
 
-        threading.Thread(target=self._install_worker, args=(ip, selected), daemon=True).start()
+        nuevos = self._enqueue(selected)
+        if not nuevos:
+            self.log("Todo lo tildado ya está en la cola o enviado", "warn")
+            return
+
+        if not self._claim_worker():
+            # Hay un worker vivo: se lo lleva él. Arrancar un segundo sería
+            # mandarle dos installs a la vez a RPI, que atiende de a uno.
+            delante = len(self.queue) - len(nuevos)
+            cuantos = f"{len(nuevos)} paquete(s)"
+            self.log(
+                f"{cuantos} a la cola" + (f" ({delante} por delante)" if delante else ""),
+                "ok",
+            )
+            self.refresh_rows()
+            return
+
+        threading.Thread(target=self._install_worker, args=(ip,), daemon=True).start()
 
     def _wait_for_console(self, ip, pkg):
         """
@@ -2119,9 +2195,17 @@ class App:
 
         return False
 
-    def _install_worker(self, ip, packages):
+    def _install_worker(self, ip):
+        """
+        Vacía la cola, de a un paquete y esperando turno.
+
+        Uno solo de estos corre a la vez: dos POST /api/install simultáneos es
+        justo lo que deja tareas huérfanas. Lo que sí puede pasar en cualquier
+        momento es que le agreguen paquetes a la cola mientras trabaja — por
+        eso la lee en cada vuelta en vez de recibir una lista cerrada.
+        """
         self.installing = True
-        self.btn_install.disabled = True
+        self.set_install_button(en_cola=True)
         self.progress.visible = True
         self.progress.value = None      # indeterminado
         self._safe_update()
@@ -2134,21 +2218,27 @@ class App:
                 self.set_chip(self.chip_ps4, "PS4 no responde", RED, ft.Icons.ERROR)
                 return
             if state == "busy":
-                self.log("La app de la consola no contesta. Cancelo para no encolar.", "error")
-                self.log("Cerrala y volvé a abrirla en la PS4, después reintentá.", "info")
-                self.set_chip(self.chip_ps4, "PS4 trabada", AMBER, ft.Icons.WARNING_ROUNDED)
-                return
-            self.set_chip(self.chip_ps4, "PS4 lista", GREEN, ft.Icons.CHECK_CIRCLE)
+                # NO se aborta: que la consola esté bajando algo es lo normal,
+                # no un error. Antes moría acá con "Cancelo para no encolar" y
+                # no había forma de sumar un paquete sin abrir otra instancia.
+                self.log("La consola está ocupada; espero turno para cada envío.", "info")
+                self.set_chip(self.chip_ps4, "PS4 ocupada", AMBER, ft.Icons.HOURGLASS_TOP_ROUNDED)
+            else:
+                self.set_chip(self.chip_ps4, "PS4 lista", GREEN, ft.Icons.CHECK_CIRCLE)
 
             local = self.f_local.value
             port = self.f_port.value
-            total = len(packages)
+            i = 0
             ok_count = 0
+            enviados = []
 
-            for i, pkg in enumerate(packages, 1):
-                if self.stopping:
-                    self.log("Envío interrumpido", "warn")
+            while not self.stopping:
+                pkg = self._dequeue()
+                if pkg is None:
                     break
+                i += 1
+                total = i + len(self.queue)   # se mueve: pueden sumar más
+                enviados.append(pkg)
 
                 name = pkg["name"]
 
@@ -2208,10 +2298,13 @@ class App:
 
                 self.refresh_rows()
 
-                if i < total and not self.stopping:
+                if self.queue and not self.stopping:
                     time.sleep(3)
 
-            sin_confirmar = sum(1 for p in packages if p.get("state") == "queued")
+            total = len(enviados)
+            if not total:
+                return
+            sin_confirmar = sum(1 for p in enviados if p.get("state") == "queued")
             if ok_count == total:
                 self.log(f"{ok_count} de {total} en cola. Seguí el progreso acá arriba.", "ok")
             elif ok_count or sin_confirmar:
@@ -2225,16 +2318,41 @@ class App:
                 self.log("La consola rechazó todos los paquetes.", "error")
 
         finally:
-            self.installing = False
             # El pedido de corte ya se cumplió: si queda arriba, el próximo
             # envío se abortaría solo y sin decir por qué.
+            corte = self.stopping
             self.stopping = False
-            self.btn_install.disabled = self.httpd is None
+
+            # Alguien puede haber encolado entre la última vuelta del while y
+            # este finally. Si quedó algo, `installing` NO baja —así nadie
+            # arranca un segundo worker— y este deja un relevo.
+            with self.queue_lock:
+                relevo = bool(self.queue) and not corte
+                if not relevo:
+                    self.installing = False
+
+            if relevo:
+                threading.Thread(
+                    target=self._install_worker, args=(ip,), daemon=True
+                ).start()
+                return
+
+            # Lo que quedó sin mandar vuelve a "idle": si se quedara en
+            # "pending" no se podría re-encolar nunca (EN_JUEGO lo filtra).
+            for pkg in self._drain_queue():
+                pkg["state"] = "idle"
+            self.set_install_button(en_cola=False)
             self.refresh_rows()
 
     def on_cancel_all(self, _):
         """Corta el envío en curso y manda stop_task a todo lo que esté activo."""
         self.stopping = True
+
+        # Lo que todavía no salió se descarta acá: no tiene task_id, así que
+        # no hay nada que darle de baja a la consola.
+        for pkg in self._drain_queue():
+            pkg["state"] = "idle"
+
         active = [p for p in self.pkgs
                   if p.get("task_id") is not None
                   and p.get("state") in ("preparing", "downloading", "installing", "paused")]

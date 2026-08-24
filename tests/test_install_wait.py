@@ -9,6 +9,7 @@ cliente. Esa tarea queda huérfana: no se puede seguir, ni pausar, ni cancelar.
 
 import os
 import sys
+import threading
 
 import pytest
 
@@ -129,7 +130,14 @@ def _worker_app(monkeypatch, estados=("ok",), lanzar=None):
     """App lista para correr _install_worker con la red mockeada."""
     app = _app(estados)
     app.installing = False
-    app.btn_install = type("C", (), {"disabled": False})()
+    app.queue = []
+    app.queue_lock = threading.Lock()
+    app.pkgs = []
+    boton = type("C", (), {"disabled": False})()
+    boton.content = type("Row", (), {})()
+    boton.content.controls = [type("C", (), {"name": None})(),
+                              type("C", (), {"value": ""})()]
+    app.btn_install = boton
     app.progress = type("C", (), {"visible": False, "value": 0})()
     app._safe_update = lambda: None
     app.set_chip = lambda *a, **k: None
@@ -151,7 +159,8 @@ def test_timeout_marca_en_cola_sin_confirmar_no_error(monkeypatch):
     app = _worker_app(monkeypatch, lanzar=socket.timeout())
     pkg = _pkg()
 
-    app._install_worker("192.168.1.35", [pkg])
+    app._enqueue([pkg])
+    app._install_worker("192.168.1.35")
 
     assert pkg["state"] == "queued", f"quedó en {pkg['state']}"
     assert not any(kind == "error" for kind, _ in app.logs), app.logs
@@ -162,7 +171,8 @@ def test_no_aconseja_reiniciar_la_consola(monkeypatch):
     import socket
     app = _worker_app(monkeypatch, lanzar=socket.timeout())
 
-    app._install_worker("192.168.1.35", [_pkg()])
+    app._enqueue([_pkg()])
+    app._install_worker("192.168.1.35")
 
     assert not any("reinicia" in t.lower() for _, t in app.logs), app.logs
 
@@ -174,7 +184,8 @@ def test_espera_turno_antes_de_cada_envio(monkeypatch):
                       lanzar=socket.timeout())
     p1, p2 = _pkg(name="a.pkg"), _pkg(name="b.pkg")
 
-    app._install_worker("192.168.1.35", [p1, p2])
+    app._enqueue([p1, p2])
+    app._install_worker("192.168.1.35")
 
     # 1 del chequeo inicial + 1 por p1 + 2 esperando + 1 al liberarse
     assert len(app.consultas) >= 4, app.consultas
@@ -185,6 +196,8 @@ def test_espera_turno_antes_de_cada_envio(monkeypatch):
 
 def _app_cancelable(pkgs, installing):
     app = App.__new__(App)
+    app.queue = []
+    app.queue_lock = threading.Lock()
     app.stopping = False
     app.installing = installing
     app.pkgs = pkgs
