@@ -35,7 +35,7 @@ def _app(estados):
 
 
 def _pkg(**over):
-    p = {"name": "juego.pkg", "state": "idle", "size": 1000}
+    p = {"name": "juego.pkg", "path": "/carpeta/juego.pkg", "state": "idle", "size": 1000}
     p.update(over)
     return p
 
@@ -178,3 +178,4 @@ def test_espera_turno_antes_de_cada_envio(monkeypatch):
 
     # 1 del chequeo inicial + 1 por p1 + 2 esperando + 1 al liberarse
     assert len(app.consultas) >= 4, app.consultas
+

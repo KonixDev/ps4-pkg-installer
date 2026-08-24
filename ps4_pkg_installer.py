@@ -263,8 +263,20 @@ class PkgHandler(SimpleHTTPRequestHandler):
     notify = None
     protocol_version = "HTTP/1.1"
 
+    # {"/p1.pkg": "/ruta/real/con espacios/JUEGO.pkg"}. Ver App._publish.
+    aliases = {}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=PkgHandler.root, **kwargs)
+
+    def translate_path(self, path):
+        """
+        El alias manda: si la ruta pedida es una publicada, devolvemos el
+        archivo real esté donde esté, sin pasar por `root`.
+        """
+        clean = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0])
+        real = PkgHandler.aliases.get(clean)
+        return real if real else super().translate_path(path)
 
     def log_message(self, fmt, *args):
         if PkgHandler.notify:
@@ -1681,6 +1693,27 @@ class App:
 
     # ------------------------------------------------------------ servidor
 
+    def _publish(self, pkg):
+        """
+        Deja el PKG accesible bajo una ruta plana y ASCII, y la devuelve.
+
+        Medido contra la consola: RPI decodifica el percent-encoding de la URL
+        y arma el request HTTP con el resultado crudo. Un solo espacio en la
+        ruta le parte el request line y falla en 21 ms sin abrir un socket
+        ("Unable to set up prerequisites"). El mismo archivo servido como
+        /p1.pkg entra sin chistar. No es cuestión de codificar mejor: %20 es
+        correcto y falla igual, porque el bug está del lado que decodifica.
+
+        El alias se asigna una sola vez por paquete y nunca se reusa: si fuera
+        por posición en la tanda, reenviar uno solo le robaría la ruta a otro
+        que todavía está descargando.
+        """
+        if not pkg.get("alias"):
+            self._alias_seq = getattr(self, "_alias_seq", 0) + 1
+            pkg["alias"] = f"/p{self._alias_seq}.pkg"
+        PkgHandler.aliases[pkg["alias"]] = pkg["path"]
+        return pkg["alias"]
+
     def start_server(self):
         """Levanta el servidor solo. Si el puerto está ocupado, prueba los siguientes."""
         self.stop_server()
@@ -1895,39 +1928,38 @@ class App:
         durante la transferencia — la API de RPI queda muda mientras descarga,
         así que sin esto la barra no se movería nunca.
         """
+        # El pedido viene por el alias (/p1.pkg), no por el nombre real, y la
+        # consola le cuelga su propia query: ?downloadId=...&threadId=...
         clean = urllib.parse.unquote(path.split("?", 1)[0])
-        name = os.path.basename(clean) or path
+        pkg = next((p for p in self.pkgs if p.get("alias") == clean), None)
+        name = pkg["name"] if pkg else (os.path.basename(clean) or path)
 
         if not rng:
             self.log(f"La PS4 está descargando {name}", "step")
             return
 
         m = self._RE_RANGE_START.match(rng.strip())
-        if not m:
+        if not m or not pkg:
             return
         start = int(m.group(1))
 
-        for pkg in self.pkgs:
-            if pkg["name"] != name:
-                continue
-            # La consola pide rangos fuera de orden (header, sfo, icono):
-            # nos quedamos con la marca más alta alcanzada, nunca retrocede.
-            if start > pkg.get("served_pos", 0):
-                pkg["served_pos"] = start
-                self.refresh_rows()
+        # La consola pide rangos fuera de orden (header, sfo, icono):
+        # nos quedamos con la marca más alta alcanzada, nunca retrocede.
+        if start > pkg.get("served_pos", 0):
+            pkg["served_pos"] = start
+            self.refresh_rows()
 
-            # Antes cada rango servido escribía su propia línea: docenas por
-            # paquete, todas casi iguales, y los mensajes que importan se
-            # ahogaban. Ahora es una línea de avance cada 15 segundos.
-            ahora = time.time()
-            if ahora - pkg.get("last_log", 0) >= 15:
-                pkg["last_log"] = ahora
-                hechos, total = self._progress_of(pkg)
-                self.log(
-                    f"{pkg.get('title') or name} · {human_size(hechos)} de "
-                    f"{human_size(total)} servidos", "step",
-                )
-            break
+        # Antes cada rango servido escribía su propia línea: docenas por
+        # paquete, todas casi iguales, y los mensajes que importan se
+        # ahogaban. Ahora es una línea de avance cada 15 segundos.
+        ahora = time.time()
+        if ahora - pkg.get("last_log", 0) >= 15:
+            pkg["last_log"] = ahora
+            hechos, total = self._progress_of(pkg)
+            self.log(
+                f"{pkg.get('title') or name} · {human_size(hechos)} de "
+                f"{human_size(total)} servidos", "step",
+            )
 
     # ------------------------------------------------------------ extracción
 
@@ -2120,10 +2152,9 @@ class App:
                 pkg["error"] = ""
                 self.refresh_rows()
 
-                # quote con safe="/" mantiene los separadores del subdirectorio
-                # y escapa el resto (espacios, corchetes, acentos).
-                rel_url = urllib.parse.quote(pkg.get("rel", name).replace(os.sep, "/"), safe="/")
-                url = f"http://{local}:{port}/{rel_url}"
+                # La URL no lleva el nombre real: RPI se atraganta con los
+                # espacios (y todo lo demás) por más que vayan escapados.
+                url = f"http://{local}:{port}{self._publish(pkg)}"
                 self.log(f"[{i}/{total}] Enviando {name}", "step")
 
                 body = json.dumps({"type": "direct", "packages": [url]}).encode()

@@ -153,44 +153,48 @@ def _app_con_pkgs(pkgs):
 
 
 def test_on_download_deriva_la_posicion_del_range():
-    pkg = _pkg(name="juego.pkg", size=1000, transferred=0)
+    pkg = _pkg(name="juego.pkg", size=1000, transferred=0, alias="/p1.pkg")
     app = _app_con_pkgs([pkg])
 
-    app._on_download("/juego.pkg", "bytes=400-900")
+    app._on_download("/p1.pkg", "bytes=400-900")
 
     assert pkg["served_pos"] == 400
 
 
 def test_on_download_ignora_el_query_string():
-    """RPI agrega ?downloadId=...&r=... al pedir; el nombre está antes del '?'."""
-    pkg = _pkg(name="juego.pkg", size=1000)
+    """RPI agrega ?downloadId=...&r=... al pedir; el alias está antes del '?'."""
+    pkg = _pkg(name="juego.pkg", size=1000, alias="/p1.pkg")
     app = _app_con_pkgs([pkg])
 
     app._on_download(
-        "/juego.pkg?downloadId=0000001f&du=00&serverIpAddr=192.168.1.73&r=0b",
+        "/p1.pkg?downloadId=0000001f&du=00&serverIpAddr=192.168.1.73&r=0b",
         "bytes=700-800",
     )
 
     assert pkg["served_pos"] == 700
 
 
-def test_on_download_desescapa_el_nombre():
-    """Los releases traen corchetes: _[5.05]_ viaja como _%5B5.05%5D_."""
-    pkg = _pkg(name="TW3_[5.05]_OPOISSO893.pkg", size=1000)
+def test_on_download_sigue_un_nombre_que_rpi_no_podria_pedir():
+    """
+    Los releases traen corchetes y espacios. Ya no viajan en la URL —RPI se
+    atraganta con ellos, ver test_url_alias— pero el progreso tiene que
+    seguir atribuyéndose al paquete igual.
+    """
+    pkg = _pkg(name="TW3_[5.05] OPOISSO893.pkg", size=1000, alias="/p7.pkg")
     app = _app_con_pkgs([pkg])
 
-    app._on_download("/TW3_%5B5.05%5D_OPOISSO893.pkg", "bytes=500-600")
+    app._on_download("/p7.pkg", "bytes=500-600")
 
     assert pkg["served_pos"] == 500
 
 
 def test_on_download_no_retrocede():
     """La PS4 pide rangos fuera de orden (header, sfo, icono). Solo subir."""
-    pkg = _pkg(name="juego.pkg", size=1000)
+    pkg = _pkg(name="juego.pkg", size=1000, alias="/p1.pkg")
     app = _app_con_pkgs([pkg])
 
-    app._on_download("/juego.pkg", "bytes=800-900")
-    app._on_download("/juego.pkg", "bytes=10-20")
+    app._on_download("/p1.pkg", "bytes=800-900")
+    app._on_download("/p1.pkg", "bytes=10-20")
 
     assert pkg["served_pos"] == 800
 
