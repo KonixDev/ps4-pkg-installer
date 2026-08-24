@@ -233,11 +233,26 @@ def choose_folder(initial=None):
 
 
 class _Limited:
-    """Envuelve un archivo para entregar solo `length` bytes desde la posición actual."""
+    """
+    Envuelve un archivo para entregar solo `length` bytes desde la posición
+    actual, e informa cuánto se entregó de verdad.
 
-    def __init__(self, f, length):
+    Lo segundo importa tanto como lo primero: mientras la consola descarga, su
+    API no contesta y este es el único lugar del programa que sabe por dónde
+    va. Contar el byte donde ARRANCA el rango deja la barra corta por el
+    tamaño de un chunk entero —la consola los pide de cientos de MB— y por eso
+    un juego de 37 GB se clavaba en 98% para siempre.
+    """
+
+    AVISAR_CADA = 8 << 20      # un chunk de 537 MB tarda minutos: no esperamos al final
+
+    def __init__(self, f, length, start=0, on_progress=None):
         self.f = f
         self.remaining = length
+        self.start = start
+        self.on_progress = on_progress
+        self.servido = 0
+        self._ultimo_aviso = 0
 
     def read(self, n=-1):
         if self.remaining <= 0:
@@ -246,10 +261,21 @@ class _Limited:
             n = self.remaining
         data = self.f.read(n)
         self.remaining -= len(data)
+        self.servido += len(data)
+        if self.servido - self._ultimo_aviso >= self.AVISAR_CADA:
+            self._avisar()
         return data
 
     def close(self):
+        # El aviso final es el que cierra el 100%: si la conexión se cortó a
+        # mitad, `servido` dice lo que salió de verdad, no lo que se pidió.
+        self._avisar()
         self.f.close()
+
+    def _avisar(self):
+        if self.on_progress and self.servido != self._ultimo_aviso:
+            self._ultimo_aviso = self.servido
+            self.on_progress(self.start + self.servido)
 
 
 class PkgHandler(SimpleHTTPRequestHandler):
@@ -261,6 +287,7 @@ class PkgHandler(SimpleHTTPRequestHandler):
 
     root = "."
     notify = None
+    served = None          # served(path, byte_alcanzado) — ver App._on_served
     protocol_version = "HTTP/1.1"
 
     # {"/p1.pkg": "/ruta/real/con espacios/JUEGO.pkg"}. Ver App._publish.
@@ -277,6 +304,10 @@ class PkgHandler(SimpleHTTPRequestHandler):
         clean = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0])
         real = PkgHandler.aliases.get(clean)
         return real if real else super().translate_path(path)
+
+    def _servido(self, pos):
+        if PkgHandler.served:
+            PkgHandler.served(self.path, pos)
 
     def log_message(self, fmt, *args):
         # Un request malformado se loguea ANTES de estar parseado, así que ni
@@ -347,7 +378,7 @@ class PkgHandler(SimpleHTTPRequestHandler):
                 "Last-Modified", self.date_time_string(os.fstat(f.fileno()).st_mtime)
             )
             self.end_headers()
-            return _Limited(f, length)
+            return _Limited(f, length, start=start, on_progress=self._servido)
 
         except Exception:
             f.close()
@@ -403,6 +434,7 @@ class App:
         page.update()
 
         PkgHandler.notify = self._on_download
+        PkgHandler.served = self._on_served
         page.window.on_event = self._on_window_event
 
         if self.cfg.get("folder"):
@@ -1648,7 +1680,7 @@ class App:
             if total:
                 bits.append(f"{human_size(done)} de {human_size(total)}")
             if pkg.get("stale"):
-                bits.append("avance medido en el servidor local")
+                bits.append(self._detalle_transferencia(pkg))
             else:
                 eta = human_eta(pkg.get("rest_sec"))
                 if eta and state == "downloading":
@@ -2027,6 +2059,36 @@ class App:
                 f"{pkg.get('title') or name} · {human_size(hechos)} de "
                 f"{human_size(total)} servidos", "step",
             )
+
+    def _on_served(self, path, pos):
+        """
+        Bytes que salieron de verdad hacia la consola.
+
+        _on_download marca el arranque de cada rango; esto marca el avance
+        dentro del rango. Sin lo segundo la barra se queda corta por el tamaño
+        del último chunk —medido en un envío real: el update paró de moverse en
+        "6.6 GB de 6.8 GB" y se quedó en 97% con la descarga ya terminada.
+        """
+        clean = urllib.parse.unquote(path.split("?", 1)[0])
+        pkg = next((p for p in self.pkgs if p.get("alias") == clean), None)
+        if not pkg or pos <= pkg.get("served_pos", 0):
+            return
+
+        pkg["served_pos"] = pos
+        # Repintar en cada aviso sería repintar cada 8 MB durante horas.
+        ahora = time.time()
+        if ahora - pkg.get("last_paint", 0) >= 1:
+            pkg["last_paint"] = ahora
+            self.refresh_rows()
+
+    def _detalle_transferencia(self, pkg):
+        """Qué decir cuando la barra se alimenta del servidor local."""
+        hechos, total = self._progress_of(pkg)
+        if total and hechos >= total:
+            # Ya no falta nada por transferir, y lo que falta —que la consola
+            # termine de instalar— no lo sabemos: no contesta la API.
+            return "Transferido entero · la consola está terminando"
+        return "avance medido en el servidor local"
 
     # ------------------------------------------------------------ extracción
 
