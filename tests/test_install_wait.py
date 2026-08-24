@@ -179,3 +179,46 @@ def test_espera_turno_antes_de_cada_envio(monkeypatch):
     # 1 del chequeo inicial + 1 por p1 + 2 esperando + 1 al liberarse
     assert len(app.consultas) >= 4, app.consultas
 
+
+# --------------------------------------------------------------- cancelación
+
+
+def _app_cancelable(pkgs, installing):
+    app = App.__new__(App)
+    app.stopping = False
+    app.installing = installing
+    app.pkgs = pkgs
+    app.logs = []
+    app.log = lambda t, kind="info": app.logs.append((kind, t))
+    app.refresh_rows = lambda: None
+    return app
+
+
+def test_cancelar_corta_el_envio_aunque_todavia_no_haya_task_id():
+    """
+    Entre que se elige un paquete y la consola devuelve su task_id pasa un
+    rato largo: el envío espera turno (_wait_for_console puede quedarse ahí
+    horas mientras baja el anterior). Si en ese momento se cancela, no hay
+    ninguna tarea con task_id para dar de baja — pero el envío SÍ está en
+    curso y hay que cortarlo.
+    """
+    pkg = _pkg(state="waiting", task_id=None)
+    app = _app_cancelable([pkg], installing=True)
+
+    app.on_cancel_all(None)
+
+    assert app.stopping is True, "el envío en curso siguió adelante"
+    assert not any("no hay tareas activas" in t.lower() for _, t in app.logs)
+
+
+def test_cancelar_sin_nada_en_curso_no_deja_la_app_trabada():
+    """
+    Al revés: sin envío ni tareas, cancelar no puede dejar `stopping` en True
+    —el próximo envío abortaría solo, sin explicación.
+    """
+    app = _app_cancelable([_pkg(state="idle", task_id=None)], installing=False)
+
+    app.on_cancel_all(None)
+
+    assert app.stopping is False
+    assert any("no hay tareas activas" in t.lower() for _, t in app.logs)

@@ -279,8 +279,13 @@ class PkgHandler(SimpleHTTPRequestHandler):
         return real if real else super().translate_path(path)
 
     def log_message(self, fmt, *args):
+        # Un request malformado se loguea ANTES de estar parseado, así que ni
+        # `path` ni `headers` existen todavía. Pasaba de verdad: la consola
+        # corta conexiones a medias y cada una dejaba un AttributeError.
         if PkgHandler.notify:
-            PkgHandler.notify(self.path, self.headers.get("Range"))
+            headers = getattr(self, "headers", None)
+            rng = headers.get("Range") if headers else None
+            PkgHandler.notify(getattr(self, "path", ""), rng)
 
 
     def end_headers(self):
@@ -2062,7 +2067,13 @@ class App:
 
         selected = [p for p in self.pkgs if p["cb"].value]
         if not selected:
-            self.log("No seleccionaste ningún paquete", "warn")
+            # Dos causas muy distintas bajo el mismo mensaje: se vio en un log
+            # real "No seleccionaste ningún paquete" con la lista mostrando
+            # todo tildado, y así no hay forma de saber cuál de las dos fue.
+            if not self.pkgs:
+                self.log("La lista está vacía: no hay paquetes para enviar", "warn")
+            else:
+                self.log(f"Ninguno de los {len(self.pkgs)} paquetes está tildado", "warn")
             return
 
         threading.Thread(target=self._install_worker, args=(ip, selected), daemon=True).start()
@@ -2215,6 +2226,9 @@ class App:
 
         finally:
             self.installing = False
+            # El pedido de corte ya se cumplió: si queda arriba, el próximo
+            # envío se abortaría solo y sin decir por qué.
+            self.stopping = False
             self.btn_install.disabled = self.httpd is None
             self.refresh_rows()
 
@@ -2226,6 +2240,12 @@ class App:
                   and p.get("state") in ("preparing", "downloading", "installing", "paused")]
 
         if not active:
+            if self.installing:
+                # Todavía no hay ningún task_id que dar de baja, pero el envío
+                # está en curso (esperando turno, o entre paquete y paquete).
+                # `stopping` queda arriba: lo baja _install_worker al cortar.
+                self.log("Corto el envío en curso", "warn")
+                return
             self.log("No hay tareas activas para cancelar", "info")
             self.stopping = False
             return

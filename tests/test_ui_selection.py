@@ -87,3 +87,34 @@ def test_sin_categoria_cae_al_final():
     pkgs = [_pkg("x", cat="", title="Sin cat"), _pkg("g", cat="gd", title="Juego")]
 
     assert [p["title"] for p in sorted(pkgs, key=app.group_key)] == ["Juego", "Sin cat"]
+
+
+def test_el_aviso_distingue_lista_vacia_de_nada_tildado():
+    """
+    Se vio en un log real "No seleccionaste ningún paquete" con la lista
+    mostrando los dos paquetes tildados. Con un solo mensaje para los dos
+    casos no hay manera de saber cuál pasó; la causa quedó sin establecer.
+    """
+    from ps4_pkg_installer import App
+
+    class _Campo:
+        def __init__(self, v): self.value = v
+
+    def _app(pkgs):
+        app = App.__new__(App)
+        app.installing = False
+        app.pkgs = pkgs
+        app.f_ps4 = _Campo("192.168.1.35")
+        app.logs = []
+        app.log = lambda t, kind="info": app.logs.append((kind, t))
+        return app
+
+    vacia = _app([])
+    vacia.on_install(None)
+    assert any("lista está vacía" in t for _, t in vacia.logs)
+
+    class _Cb:
+        value = False
+    con_pkgs = _app([{"cb": _Cb()}, {"cb": _Cb()}])
+    con_pkgs.on_install(None)
+    assert any("Ninguno de los 2" in t for _, t in con_pkgs.logs)
