@@ -91,11 +91,23 @@ That is the whole setup. No Node, no .NET, no build step.
 
 ### Build it yourself
 
+**On Windows** a script does the whole thing: double-click
+**`build-windows.bat`**. It pulls the dependencies and the 7-Zip build the app
+uses internally, compiles, and leaves `dist\PS4 PKG Installer.exe` — a single
+file that runs on any Windows with nothing installed. All you need on the
+machine is Python (with *Add python.exe to PATH* ticked).
+
+On macOS and Linux, by hand:
+
 ```bash
 pip install -r requirements.txt pyinstaller
 pyinstaller --onefile --windowed --name "PS4 PKG Installer" \
   --collect-all flet --collect-all flet_desktop ps4_pkg_installer.py
 ```
+
+Note that command does not embed 7-Zip: the app will look for the system one
+(`brew install sevenzip` / `apt install p7zip-full`). The binaries the CI
+publishes do carry it inside.
 
 ---
 
