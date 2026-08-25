@@ -46,13 +46,91 @@ jobs:
           # "ModuleNotFoundError: No module named 'flet_desktop'".
           python -c "import flet_desktop, os; print('flet_desktop OK:', os.path.dirname(flet_desktop.__file__))"
 
+      - name: Fetch the 7-Zip CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vendor
+          case "${{ runner.os }}" in
+            macOS)
+              curl -fsSL https://www.7-zip.org/a/7z2408-mac.tar.xz -o 7z.tar.xz
+              tar -xf 7z.tar.xz 7zz && mv 7zz vendor/7zz && chmod +x vendor/7zz
+              ;;
+            Linux)
+              curl -fsSL https://www.7-zip.org/a/7z2408-linux-x64.tar.xz -o 7z.tar.xz
+              tar -xf 7z.tar.xz 7zz && mv 7zz vendor/7zz && chmod +x vendor/7zz
+              ;;
+            Windows)
+              curl -fsSL https://www.7-zip.org/a/7z2408-extra.7z -o 7z.7z
+              7z x 7z.7z -ovendor 7za.exe
+              ;;
+          esac
+          ls -l vendor/
+
+      - name: Fetch a fallback RAR extractor
+        shell: bash
+        continue-on-error: true
+        run: |
+          # 7-Zip lee los headers de cualquier RAR5 pero no implementa todos
+          # los codecs: con un RAR comprimido ("-m3") lista bien el contenido y
+          # muere al extraer con "Unsupported Method". unar/unrar sí pueden.
+          # Si este paso falla el build sigue: el ejecutable queda sin respaldo
+          # y esos archivos dan un error explicativo en vez de romper todo.
+          set -eu
+          mkdir -p vendor
+          case "${{ runner.os }}" in
+            macOS)
+              brew install unar
+              cp "$(brew --prefix)/bin/unar" vendor/unar
+              ;;
+            Linux)
+              sudo apt-get update -qq && sudo apt-get install -y unar
+              cp "$(command -v unar)" vendor/unar
+              ;;
+            Windows)
+              # RARLAB no publica un zip pelado del unrar de Windows: viene
+              # dentro del instalador autoextraíble, que 7-Zip sabe abrir.
+              curl -fsSL https://www.rarlab.com/rar/unrarw64.exe -o unrarw64.exe
+              7z x unrarw64.exe -ovendor UnRAR.exe
+              mv vendor/UnRAR.exe vendor/unrar.exe
+              ;;
+          esac
+          ls -l vendor/
+
       - name: Build
-        run: >
-          pyinstaller --noconfirm --onefile --windowed
-          --name "PS4 PKG Installer"
-          --collect-all flet
-          --collect-all flet_desktop
-          ps4_pkg_installer.py
+        shell: bash
+        run: |
+          # El separador de --add-binary es ';' en Windows y ':' en el resto.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            SEP=";"; SEVENZIP="vendor/7za.exe"; FALLBACK="vendor/unrar.exe"
+            ICONO="assets/icon.ico"
+          else
+            SEP=":"; SEVENZIP="vendor/7zz"; FALLBACK="vendor/unar"
+            # macOS quiere .icns; Linux no usa icono embebido y lo ignora.
+            ICONO="assets/icon.icns"
+          fi
+          # Los iconos van versionados a propósito: generarlos acá obligaría a
+          # instalar Pillow en el runner. Se regeneran con tools/make_icon.py.
+          if [ ! -f "$ICONO" ]; then
+            echo "::error::Falta $ICONO — corré tools/make_icon.py y commiteá assets/"
+            exit 1
+          fi
+          EXTRA=""
+          # El respaldo es opcional: si su descarga falló, se compila sin él.
+          if [ -f "$FALLBACK" ]; then
+            EXTRA="--add-binary ${FALLBACK}${SEP}."
+          else
+            echo "::warning::Sin extractor de respaldo: los RAR comprimidos no se van a poder abrir."
+          fi
+          pyinstaller --noconfirm --onefile --windowed \
+            --name "PS4 PKG Installer" \
+            --icon "$ICONO" \
+            --osx-bundle-identifier dev.konix.ps4-pkg-installer \
+            --collect-all flet \
+            --collect-all flet_desktop \
+            --add-binary "${SEVENZIP}${SEP}." \
+            $EXTRA \
+            ps4_pkg_installer.py
 
       - name: Verify the runtime got bundled
         shell: bash

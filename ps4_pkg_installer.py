@@ -22,6 +22,9 @@ from pathlib import Path
 
 import flet as ft
 
+import archives
+import pkgmeta
+
 # ---------------------------------------------------------------- paleta
 
 BG = "#0f1115"
@@ -37,6 +40,7 @@ AMBER = "#ffb454"
 
 PS4_PORT = 12800
 INSTALL_TIMEOUT = 150   # RPI baja header+entry table+sfo+icono dentro del mismo POST
+POLL_MAX_BACKOFF = 15   # tope de espera entre reintentos del poll
 MAX_DEPTH = 6           # niveles de subcarpetas a recorrer
 MAX_PKGS = 400          # tope para no colgarse si apuntan a un disco entero
 PKG_MAGIC = b"\x7fCNT"  # firma de todo PKG de PS4
@@ -120,6 +124,56 @@ def human_eta(seconds):
     return f"{s}s"
 
 
+def matches(pkg, query):
+    """
+    ¿Este paquete pasa el filtro?
+
+    Busca en el título del juego, el nombre de archivo y la subcarpeta: con
+    títulos legibles se filtra por "marrakesh", pero el nombre de archivo sigue
+    siendo lo único que distingue dos volcados del mismo juego.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    campos = (pkg.get("title", ""), pkg.get("name", ""), pkg.get("sub", ""))
+    return any(q in (c or "").lower() for c in campos)
+
+
+def apply_bulk(pkgs, accion, visibles):
+    """
+    Aplica una acción de conjunto SOLO sobre los índices visibles.
+
+    Lo que el filtro esconde conserva su tilde: es la única semántica que no
+    sorprende. Y nunca se pisa un paquete cuyo checkbox está deshabilitado,
+    que es como se marca una tarea ya en curso.
+    """
+    for i, pkg in enumerate(pkgs):
+        if i not in visibles:
+            continue
+        cb = pkg.get("cb")
+        if cb is None or cb.disabled:
+            continue
+        if accion == "all":
+            cb.value = True
+        elif accion == "none":
+            cb.value = False
+        else:
+            cb.value = not cb.value
+
+
+def group_key(pkg):
+    """
+    Orden: primero por categoría, después por título.
+
+    El orden de CATEGORY_ORDER (juego, actualización, contenido) es también el
+    orden correcto de instalación, así que la lista queda ordenada como hay que
+    instalarla sin que nadie tenga que saberlo.
+    """
+    cat = pkg.get("category") or ""
+    return (pkgmeta.CATEGORY_ORDER.get(cat, 9),
+            (pkg.get("title") or pkg.get("name") or "").lower())
+
+
 def choose_folder(initial=None):
     """
     Diálogo de carpetas del sistema operativo.
@@ -179,11 +233,26 @@ def choose_folder(initial=None):
 
 
 class _Limited:
-    """Envuelve un archivo para entregar solo `length` bytes desde la posición actual."""
+    """
+    Envuelve un archivo para entregar solo `length` bytes desde la posición
+    actual, e informa cuánto se entregó de verdad.
 
-    def __init__(self, f, length):
+    Lo segundo importa tanto como lo primero: mientras la consola descarga, su
+    API no contesta y este es el único lugar del programa que sabe por dónde
+    va. Contar el byte donde ARRANCA el rango deja la barra corta por el
+    tamaño de un chunk entero —la consola los pide de cientos de MB— y por eso
+    un juego de 37 GB se clavaba en 98% para siempre.
+    """
+
+    AVISAR_CADA = 8 << 20      # un chunk de 537 MB tarda minutos: no esperamos al final
+
+    def __init__(self, f, length, start=0, on_progress=None):
         self.f = f
         self.remaining = length
+        self.start = start
+        self.on_progress = on_progress
+        self.servido = 0
+        self._ultimo_aviso = 0
 
     def read(self, n=-1):
         if self.remaining <= 0:
@@ -192,10 +261,21 @@ class _Limited:
             n = self.remaining
         data = self.f.read(n)
         self.remaining -= len(data)
+        self.servido += len(data)
+        if self.servido - self._ultimo_aviso >= self.AVISAR_CADA:
+            self._avisar()
         return data
 
     def close(self):
+        # El aviso final es el que cierra el 100%: si la conexión se cortó a
+        # mitad, `servido` dice lo que salió de verdad, no lo que se pidió.
+        self._avisar()
         self.f.close()
+
+    def _avisar(self):
+        if self.on_progress and self.servido != self._ultimo_aviso:
+            self._ultimo_aviso = self.servido
+            self.on_progress(self.start + self.servido)
 
 
 class PkgHandler(SimpleHTTPRequestHandler):
@@ -207,14 +287,36 @@ class PkgHandler(SimpleHTTPRequestHandler):
 
     root = "."
     notify = None
+    served = None          # served(path, byte_alcanzado) — ver App._on_served
     protocol_version = "HTTP/1.1"
+
+    # {"/p1.pkg": "/ruta/real/con espacios/JUEGO.pkg"}. Ver App._publish.
+    aliases = {}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=PkgHandler.root, **kwargs)
 
+    def translate_path(self, path):
+        """
+        El alias manda: si la ruta pedida es una publicada, devolvemos el
+        archivo real esté donde esté, sin pasar por `root`.
+        """
+        clean = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0])
+        real = PkgHandler.aliases.get(clean)
+        return real if real else super().translate_path(path)
+
+    def _servido(self, pos):
+        if PkgHandler.served:
+            PkgHandler.served(self.path, pos)
+
     def log_message(self, fmt, *args):
+        # Un request malformado se loguea ANTES de estar parseado, así que ni
+        # `path` ni `headers` existen todavía. Pasaba de verdad: la consola
+        # corta conexiones a medias y cada una dejaba un AttributeError.
         if PkgHandler.notify:
-            PkgHandler.notify(self.path, self.headers.get("Range"))
+            headers = getattr(self, "headers", None)
+            rng = headers.get("Range") if headers else None
+            PkgHandler.notify(getattr(self, "path", ""), rng)
 
 
     def end_headers(self):
@@ -276,7 +378,7 @@ class PkgHandler(SimpleHTTPRequestHandler):
                 "Last-Modified", self.date_time_string(os.fstat(f.fileno()).st_mtime)
             )
             self.end_headers()
-            return _Limited(f, length)
+            return _Limited(f, length, start=start, on_progress=self._servido)
 
         except Exception:
             f.close()
@@ -287,12 +389,26 @@ class PkgHandler(SimpleHTTPRequestHandler):
 
 
 class App:
+    # Un paquete en cualquiera de estos ya está en juego: volver a encolarlo
+    # sería mandarlo dos veces.
+    VENTANA_ETA = 120       # segundos de historia para estimar la velocidad
+
+    EN_JUEGO = frozenset({
+        "pending", "sending", "waiting", "queued",
+        "preparing", "downloading", "installing", "paused",
+    })
+
     def __init__(self, page: ft.Page):
         self.page = page
         self.httpd = None
         self.port = None
         self.pkgs = []          # [{path, name, size, cb}]
+        self.queue = []         # paquetes esperando su turno de envío
+        self.queue_lock = threading.Lock()
+        self._hist_global = []  # [(t, bytes)] para estimar cuánto falta
+        self.archives = []      # comprimidos sin extraer en la carpeta
         self.installing = False
+        self.extracting = False
         self.scanning = False
 
         self.cfg = load_config()
@@ -321,6 +437,7 @@ class App:
         page.update()
 
         PkgHandler.notify = self._on_download
+        PkgHandler.served = self._on_served
         page.window.on_event = self._on_window_event
 
         if self.cfg.get("folder"):
@@ -346,7 +463,7 @@ class App:
                     ft.Row(
                         spacing=13,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
+                        controls=([
                             ft.Container(
                                 width=27,
                                 height=27,
@@ -358,6 +475,7 @@ class App:
                                     str(step), size=13.5, weight=ft.FontWeight.BOLD, color=BLUE
                                 ),
                             ),
+                        ] if step else []) + [
                             ft.Column(
                                 spacing=1,
                                 controls=[
@@ -445,7 +563,12 @@ class App:
                             ),
                         ],
                     ),
-                    ft.Row(spacing=8, controls=[self.chip_server, self.chip_ps4]),
+                    ft.Row(spacing=8, controls=[
+                        self.chip_server, self.chip_ps4,
+                        ft.IconButton(ft.Icons.SETTINGS_OUTLINED, icon_size=19,
+                                      icon_color=MUTED, tooltip="Conexión y servidor",
+                                      on_click=self.open_settings),
+                    ]),
                 ],
             ),
         )
@@ -461,7 +584,7 @@ class App:
         self.f_port.on_blur = self.on_port_change
 
         card1 = self._card(
-            1,
+            None,
             "Conexión",
             f"La PS4 debe estar en modo debug, escuchando en el puerto {PS4_PORT}",
             ft.Row(
@@ -504,6 +627,41 @@ class App:
             self.folder, size=13.5, color=TEXT, no_wrap=True, expand=True,
             overflow=ft.TextOverflow.ELLIPSIS,
         )
+        self.f_pass = ft.TextField(
+            label="Contraseña", password=True, can_reveal_password=True,
+            width=190, dense=True, border_color=BORDER, color=TEXT,
+        )
+        self.cb_delete_archives = ft.Checkbox(
+            label="borrar los comprimidos al terminar", value=False,
+            active_color=BLUE, label_style=ft.TextStyle(size=12, color=MUTED),
+        )
+        self.btn_extract = ft.ElevatedButton(
+            "Extraer", icon=ft.Icons.UNARCHIVE_ROUNDED, on_click=self.on_extract,
+        )
+        self.arch_text = ft.Text("", size=13, color=TEXT)
+        self.arch_bar = ft.ProgressBar(
+            value=0, color=BLUE, bgcolor=BORDER, height=4, border_radius=2, visible=False
+        )
+        self.arch_banner = ft.Container(
+            visible=False, padding=12, border_radius=10,
+            bgcolor=SURFACE_2, border=ft.border.all(1, BORDER),
+            content=ft.Column(spacing=8, controls=[
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Row(spacing=8, controls=[
+                            ft.Icon(ft.Icons.FOLDER_ZIP_OUTLINED, color=AMBER, size=18),
+                            self.arch_text,
+                        ]),
+                        ft.Row(spacing=8, controls=[self.f_pass, self.btn_extract]),
+                    ],
+                ),
+                self.cb_delete_archives,
+                self.arch_bar,
+            ]),
+        )
+
         self.pkg_list = ft.ListView(spacing=6, padding=6, expand=True)
         self.count_label = ft.Text("", size=12.5, color=MUTED)
 
@@ -512,40 +670,74 @@ class App:
         self.manual_path.visible = False
         self.manual_path.on_submit = self.on_manual_path
 
-        card2 = self._card(
-            2,
-            "Paquetes",
-            "Elegí la carpeta donde están tus archivos .pkg",
-            ft.Column(
+        folder_row = ft.Container(
+            bgcolor=SURFACE_2,
+            border=ft.border.all(1, BORDER),
+            border_radius=10,
+            padding=ft.padding.only(14, 4, 6, 4),
+            content=ft.Row(
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Icon(ft.Icons.FOLDER_OUTLINED, size=18, color=MUTED),
+                    self.folder_label,
+                    ft.TextButton(
+                        content=ft.Text("Cambiar", size=13.5, color=BLUE),
+                        on_click=self.on_pick_folder,
+                    ),
+                    ft.IconButton(
+                        ft.Icons.REFRESH, icon_size=18, icon_color=MUTED,
+                        tooltip="Volver a escanear",
+                        on_click=lambda _: self.scan_folder(),
+                    ),
+                ],
+            ),
+        )
+
+        # --- toolbar: filtro, acciones de conjunto y modo de vista ---
+        self.view_mode = "rows"
+        self.f_filter = ft.TextField(
+            hint_text="Filtrar…", dense=True, height=40, expand=True,
+            border_color=BORDER, color=TEXT, text_size=13,
+            prefix_icon=ft.Icons.SEARCH, on_change=lambda _: self.rebuild_list(),
+        )
+        self.visible_label = ft.Text("", size=12, color=MUTED)
+        self.seg_view = ft.SegmentedButton(
+            selected={"rows"},
+            show_selected_icon=False,
+            segments=[
+                ft.Segment(value="rows", label=ft.Text("Lista", size=12.5),
+                           icon=ft.Icon(ft.Icons.VIEW_LIST_ROUNDED, size=16)),
+                ft.Segment(value="tiles", label=ft.Text("Cuadrícula", size=12.5),
+                           icon=ft.Icon(ft.Icons.GRID_VIEW_ROUNDED, size=16)),
+            ],
+            on_change=self.on_view_change,
+        )
+        toolbar = ft.Row(
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Container(width=230, content=self.f_filter),
+                ft.TextButton(content=ft.Text("Todos", size=12.5, color=BLUE),
+                              on_click=lambda _: self.on_bulk("all")),
+                ft.TextButton(content=ft.Text("Ninguno", size=12.5, color=BLUE),
+                              on_click=lambda _: self.on_bulk("none")),
+                ft.TextButton(content=ft.Text("Invertir", size=12.5, color=BLUE),
+                              on_click=lambda _: self.on_bulk("invert")),
+                ft.Container(expand=True),
+                self.seg_view,
+                self.visible_label,
+            ],
+        )
+
+        card2 = ft.Column(
                 spacing=11,
                 expand=True,
                 controls=[
-                    ft.Container(
-                        bgcolor=SURFACE_2,
-                        border=ft.border.all(1, BORDER),
-                        border_radius=10,
-                        padding=ft.padding.only(14, 4, 6, 4),
-                        content=ft.Row(
-                            spacing=10,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Icon(ft.Icons.FOLDER_OUTLINED, size=18, color=MUTED),
-                                self.folder_label,
-                                ft.TextButton(
-                                    content=ft.Text("Cambiar", size=13.5, color=BLUE),
-                                    on_click=self.on_pick_folder,
-                                ),
-                                ft.IconButton(
-                                    ft.Icons.REFRESH,
-                                    icon_size=18,
-                                    icon_color=MUTED,
-                                    tooltip="Volver a escanear",
-                                    on_click=lambda _: self.scan_folder(),
-                                ),
-                            ],
-                        ),
-                    ),
+                    folder_row,
                     self.manual_path,
+                    self.arch_banner,
+                    toolbar,
                     ft.Container(
                         expand=True,
                         bgcolor=SURFACE_2,
@@ -555,8 +747,6 @@ class App:
                     ),
                     self.count_label,
                 ],
-            ),
-            expand=3,
         )
 
         # --- paso 3: instalar ---------------------------------------
@@ -637,7 +827,7 @@ class App:
             bgcolor=SURFACE,
             border=ft.border.all(1, BORDER),
             border_radius=14,
-            expand=2,
+            expand=True,
             content=ft.Column(
                 spacing=0,
                 expand=True,
@@ -679,27 +869,75 @@ class App:
             ),
         )
 
-        # --- raíz ---------------------------------------------------
+        # --- conexión: deja de ser un paso y pasa a ser configuración ---
+        # IP local y puerto se tocan una vez en la vida; ocupaban una tarjeta
+        # entera arriba de todo. Se van al engranaje y el encabezado se queda
+        # con lo único que importa a diario: si la consola responde.
+        self.settings_dlg = ft.AlertDialog(
+            bgcolor=SURFACE,
+            content=ft.Container(width=560, content=card1),
+            actions=[ft.TextButton("Listo", on_click=lambda _: self.close_settings())],
+        )
+
+        # --- raíz: dos pestañas, la lista se queda con la ventana ---
+        # Hechas a mano y no con ft.Tabs: en Flet 0.28.3, Tab.before_update
+        # hace isinstance(icon, IconValue) y IconValue es un Union, cosa que
+        # Python 3.9 —el que trae macOS— no admite. Con ft.Tabs la ventana ni
+        # llega a montarse. Dos botones y un par de "visible" hacen lo mismo.
+        self.panel_install = ft.Container(
+            expand=True,
+            padding=ft.padding.only(20, 14, 20, 14),
+            content=ft.Column(spacing=12, expand=True, controls=[card2, action_bar]),
+        )
+        self.panel_log = ft.Container(
+            expand=True,
+            visible=False,
+            padding=ft.padding.only(20, 14, 20, 14),
+            content=console,
+        )
+        self.tab_index = 0
+        self.tab_buttons = [self._tab_button("Instalar", 0),
+                            self._tab_button("Registro", 1)]
+
+        tabbar = ft.Container(
+            border=ft.border.only(bottom=ft.BorderSide(1, BORDER)),
+            padding=ft.padding.only(14, 0, 14, 0),
+            content=ft.Row(spacing=2, controls=self.tab_buttons),
+        )
+
         self.root = ft.Container(
             expand=True,
             bgcolor=BG,
             content=ft.Column(
                 spacing=0,
                 expand=True,
-                controls=[
-                    header,
-                    ft.Container(
-                        expand=True,
-                        padding=ft.padding.only(24, 0, 24, 22),
-                        content=ft.Column(
-                            spacing=13,
-                            expand=True,
-                            controls=[card1, card2, action_bar, console],
-                        ),
-                    ),
-                ],
+                controls=[header, tabbar, self.panel_install, self.panel_log],
             ),
         )
+
+    def _tab_button(self, label, idx):
+        """Pestaña: subrayado azul cuando está activa, gris cuando no."""
+        activo = idx == 0
+        return ft.Container(
+            padding=ft.padding.only(15, 13, 15, 11),
+            border=ft.border.only(
+                bottom=ft.BorderSide(2, BLUE if activo else "transparent")),
+            content=ft.Text(label, size=13.5, weight=ft.FontWeight.W_500,
+                            color=TEXT if activo else MUTED),
+            on_click=lambda _, i=idx: self.on_tab(i),
+            ink=True,
+        )
+
+    def on_tab(self, idx):
+        self.tab_index = idx
+        for i, btn in enumerate(self.tab_buttons):
+            activo = i == idx
+            btn.content.color = TEXT if activo else MUTED
+            btn.border = ft.border.only(
+                bottom=ft.BorderSide(2, BLUE if activo else "transparent"))
+        self.panel_install.visible = idx == 0
+        self.panel_log.visible = idx == 1
+        self._safe_update()
 
     # ------------------------------------------------------------ log
 
@@ -1024,38 +1262,233 @@ class App:
                     "path": path, "name": name, "rel": rel, "sub": sub, "size": size,
                     "state": "idle", "task_id": None, "polling": False,
                     "served": 0, "transferred": 0, "length": 0, "rest_sec": 0,
+                    "served_pos": 0, "stale": False,
+                    "title": "", "category": "", "version": "", "icon": None,
                 }
             pkg["cb"] = ft.Checkbox(
                 value=True, active_color=BLUE, on_change=lambda _: self._refresh_count()
             )
             self.pkgs.append(pkg)
-            self.pkg_list.controls.append(self._build_row(pkg))
 
         self._prev_pkgs = list(self.pkgs)
 
         if not found:
-            self.pkg_list.controls.append(
-                ft.Container(
-                    padding=26,
-                    alignment=ft.alignment.center,
-                    content=ft.Column(
-                        spacing=8,
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.Icon(ft.Icons.FOLDER_OFF_OUTLINED, size=30, color="#4a505c"),
-                            ft.Text("No hay archivos .pkg acá", size=13.5, color=MUTED),
-                            ft.Text("Se busca también en las subcarpetas", size=11.5, color="#5a616e"),
-                        ],
-                    ),
-                )
-            )
             self.log("No se encontraron .pkg ni en la carpeta ni en sus subcarpetas", "warn")
         else:
             subs = len({p["sub"] for p in self.pkgs if p.get("sub")})
             extra = f" en {subs} subcarpeta(s)" if subs else ""
             self.log(f"{len(found)} paquete(s) encontrado(s){extra}", "ok")
 
+        self.rebuild_list()
+        self._scan_archives()
+        self._load_meta_async()
+
+    def _load_meta_async(self):
+        """
+        Lee título, categoría e ícono de cada PKG en un thread.
+
+        Abrir cientos de archivos y volcar sus carátulas no puede pasar en el
+        hilo de la UI. Los paquetes ya se listaron con su nombre de archivo;
+        cuando la metadata llega, la lista se reordena y se repinta sola.
+        """
+        objetivo = list(self.pkgs)
+
+        def worker():
+            hubo = False
+            for pkg in objetivo:
+                if self.stopping or pkg not in self.pkgs:
+                    return
+                info = pkgmeta.read_pkg(pkg["path"])
+                if not info:
+                    continue
+                pkg["title"] = info.title
+                pkg["category"] = info.category
+                pkg["version"] = info.version
+                pkg["icon"] = pkgmeta.icon_path(pkg["path"], info)
+                hubo = hubo or bool(info.title)
+            if self.stopping:
+                return
+            # El orden por categoría es también el orden de instalación.
+            self.pkgs.sort(key=group_key)
+            self.rebuild_list()
+            if hubo:
+                grupos = {}
+                for pkg in self.pkgs:
+                    grupos[pkg.get("category") or ""] = grupos.get(pkg.get("category") or "", 0) + 1
+                detalle = ", ".join(
+                    f"{n} {(pkgmeta.CATEGORIES.get(c) or 'sin clasificar').lower()}"
+                    for c, n in sorted(grupos.items(), key=lambda kv: pkgmeta.CATEGORY_ORDER.get(kv[0], 9))
+                )
+                self.log(f"Metadata leída · {detalle}", "ok")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------ vista de la lista
+
+    def open_settings(self, _=None):
+        self.page.open(self.settings_dlg)
+
+    def close_settings(self, _=None):
+        self.page.close(self.settings_dlg)
+
+    def on_bulk(self, accion):
+        """Todos / Ninguno / Invertir, siempre sobre lo que dejó el filtro."""
+        visibles = {i for i, p in enumerate(self.pkgs)
+                    if matches(p, self.f_filter.value)}
+        apply_bulk(self.pkgs, accion, visibles)
+        self.rebuild_list()
+
+    def on_view_change(self, e):
+        self.view_mode = next(iter(e.control.selected), "rows")
+        self.rebuild_list()
+
+    def _group_header(self, cat, n):
+        """Encabezado de grupo: qué es y cuántos hay."""
+        return ft.Container(
+            padding=ft.padding.only(8, 12, 8, 4),
+            content=ft.Row(
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Text((pkgmeta.CATEGORIES.get(cat) or "Otros").upper(),
+                            size=10.5, weight=ft.FontWeight.W_600, color=MUTED),
+                    ft.Container(expand=True, height=1, bgcolor=BORDER),
+                    ft.Text(str(n), size=10.5, color="#69707d"),
+                ],
+            ),
+        )
+
+    def _tile(self, pkg):
+        """
+        Tarjeta para la vista cuadrícula.
+
+        Sirve para elegir: catorce carátulas se reconocen de un vistazo,
+        catorce nombres de archivo no. Para mirar instalar sigue siendo mejor
+        la lista, que tiene ancho para la barra y alinea los tamaños.
+        """
+        seleccionado = bool(pkg["cb"].value)
+        estado = pkg.get("state", "idle")
+        etiqueta, color, _ = self.STATES.get(estado, self.STATES["idle"])
+
+        arte = (
+            ft.Image(src=pkg["icon"], width=112, height=112, border_radius=7,
+                     fit=ft.ImageFit.COVER)
+            if pkg.get("icon") else
+            ft.Container(width=112, height=112, border_radius=7, bgcolor=SURFACE_2,
+                         alignment=ft.alignment.center,
+                         content=ft.Icon(ft.Icons.INVENTORY_2_OUTLINED, size=26, color=MUTED))
+        )
+
+        def alternar(_, p=pkg):
+            if p["cb"].disabled:
+                return
+            p["cb"].value = not p["cb"].value
+            self.rebuild_list()
+
+        return ft.Container(
+            width=130, padding=9, border_radius=9,
+            bgcolor="#14273d" if seleccionado else BG,
+            border=ft.border.all(1, BLUE if seleccionado else BORDER),
+            on_click=alternar, ink=True,
+            content=ft.Column(spacing=7, controls=[
+                arte,
+                ft.Text(pkg.get("title") or pkg["name"], size=11.5, color=TEXT,
+                        max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+                    ft.Text(human_size(pkg["size"]), size=10.5, color=MUTED),
+                    ft.Text(etiqueta, size=10.5, color=color),
+                ]),
+            ]),
+        )
+
+    def rebuild_list(self):
+        """
+        Rearma la lista visible: filtra, agrupa por categoría y pinta.
+
+        Se rearma en vez de ocultar porque el cambio de vista cambia el tipo de
+        control. El estado vivo de cada paquete vive en su dict, no en la fila,
+        así que reconstruir no corta ninguna tarea en curso.
+        """
+        if not hasattr(self, "pkg_list"):
+            return
+        self.pkg_list.controls.clear()
+        q = self.f_filter.value if hasattr(self, "f_filter") else ""
+        visibles = [p for p in self.pkgs if matches(p, q)]
+
+        cur = object()
+        cajon = None
+        for pkg in visibles:
+            cat = pkg.get("category") or ""
+            if cat != cur:
+                cur = cat
+                n = sum(1 for p in visibles if (p.get("category") or "") == cat)
+                self.pkg_list.controls.append(self._group_header(cat, n))
+                cajon = None
+                if self.view_mode == "tiles":
+                    cajon = ft.Row(wrap=True, spacing=8, run_spacing=8)
+                    self.pkg_list.controls.append(cajon)
+            control = self._tile(pkg) if self.view_mode == "tiles" else self._build_row(pkg)
+            (cajon.controls if cajon is not None else self.pkg_list.controls).append(control)
+
+        if not visibles:
+            self.pkg_list.controls.append(
+                ft.Container(
+                    padding=26, alignment=ft.alignment.center,
+                    content=ft.Column(
+                        spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[
+                            ft.Icon(ft.Icons.FOLDER_OFF_OUTLINED, size=30, color="#4a505c"),
+                            ft.Text("No hay paquetes que mostrar", size=13.5, color=MUTED),
+                        ],
+                    ),
+                )
+            )
+
+        oculto = len(self.pkgs) - len(visibles)
+        self.visible_label.value = (
+            f"{len(visibles)} a la vista · {oculto} ocultos" if oculto else ""
+        )
+        if self.view_mode == "rows":
+            self.refresh_rows()
         self._refresh_count()
+
+    def _scan_archives(self):
+        """Busca comprimidos sin extraer y muestra el banner si hay alguno."""
+        if self.extracting:
+            return
+        try:
+            self.archives = archives.find_archives(self.folder, max_depth=MAX_DEPTH)
+        except Exception as e:
+            self.archives = []
+            self.log(f"No pude revisar comprimidos: {e}", "warn")
+
+        if not self.archives:
+            self.arch_banner.visible = False
+            return
+
+        if not archives.seven_zip_path():
+            self.arch_banner.visible = False
+            self.log(
+                "Hay comprimidos sin extraer pero falta el binario de 7-Zip. "
+                "Corriendo desde fuente: brew install sevenzip", "warn"
+            )
+            return
+
+        total = sum(a.total_size for a in self.archives)
+        incompletos = [a for a in self.archives if a.missing_parts]
+
+        self.arch_text.value = (
+            f"{len(self.archives)} comprimido(s) sin extraer  ·  {human_size(total)}"
+        )
+        self.arch_banner.visible = True
+        self.btn_extract.disabled = bool(incompletos)
+
+        for a in incompletos:
+            self.log(
+                f"{a.name}: faltan volúmenes ({', '.join(a.missing_parts)})", "error"
+            )
+        if not incompletos:
+            self.log(f"{len(self.archives)} comprimido(s) sin extraer", "warn")
 
     def _walk_pkgs(self, root):
         """
@@ -1122,11 +1555,23 @@ class App:
         "error":       ("Error",       RED,    ft.Icons.ERROR_ROUNDED),
         "cancelled":   ("Cancelado",   MUTED,  ft.Icons.CANCEL_ROUNDED),
         "unknown":     ("Sin datos",   MUTED,  ft.Icons.HELP_OUTLINE_ROUNDED),
+        "waiting":     ("Esperando turno", MUTED, ft.Icons.HOURGLASS_EMPTY_ROUNDED),
+        "queued":      ("En cola, sin confirmar", AMBER, ft.Icons.PENDING_ROUNDED),
+        "pending":     ("En la cola",  MUTED,  ft.Icons.LIST_ALT_ROUNDED),
+    }
+
+    # La franja izquierda repite el estado en forma además de en texto: con
+    # dieciséis paquetes, encontrar el que necesita atención deja de ser lectura.
+    STRIPE = {
+        "sending": BLUE, "preparing": BLUE, "downloading": BLUE,
+        "installing": AMBER, "paused": AMBER, "waiting": AMBER, "queued": AMBER,
+        "done": GREEN, "error": RED,
     }
 
     def _build_row(self, pkg):
         """Fila con estado, barra de progreso y controles de la tarea."""
-        pkg["ui_state"] = ft.Text("", size=12, color=MUTED)
+        pkg["ui_state"] = ft.Text("", size=12, color=MUTED, width=118,
+                                  no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS)
         pkg["ui_icon"] = ft.Icon(ft.Icons.CIRCLE_OUTLINED, size=16, color=MUTED)
         pkg["ui_detail"] = ft.Text("", size=11.5, color=MUTED)
         pkg["ui_bar"] = ft.ProgressBar(
@@ -1144,59 +1589,86 @@ class App:
             ft.Icons.STOP_ROUNDED, icon_size=17, icon_color=RED, visible=False,
             tooltip="Cancelar", on_click=lambda _, p=pkg: self.task_action(p, "stop_task"),
         )
+        pkg["ui_unqueue"] = ft.IconButton(
+            ft.Icons.REMOVE_CIRCLE_OUTLINE_ROUNDED, icon_size=17, icon_color=MUTED,
+            visible=False, tooltip="Sacar de la cola",
+            on_click=lambda _, p=pkg: self.unqueue(p),
+        )
+
+        pkg["ui_stripe"] = ft.Container(width=3, height=38, border_radius=2,
+                                        bgcolor="transparent")
+        # Un paquete sin carátula no deja un hueco: muestra el marcador. De 18
+        # paquetes reales, uno no traía icon0.png.
+        caratula = (
+            ft.Image(src=pkg["icon"], width=34, height=34, border_radius=6,
+                     fit=ft.ImageFit.COVER)
+            if pkg.get("icon") else
+            ft.Container(width=34, height=34, border_radius=6, bgcolor=SURFACE_2,
+                         alignment=ft.alignment.center,
+                         content=ft.Icon(ft.Icons.INVENTORY_2_OUTLINED, size=16, color=MUTED))
+        )
+        titulo = pkg.get("title") or pkg["name"]
 
         row = ft.Container(
-            padding=ft.padding.symmetric(6, 10),
+            padding=ft.padding.only(0, 6, 10, 6),
             border_radius=8,
-            content=ft.Column(
-                spacing=5,
+            content=ft.Row(
+                spacing=9,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
-                    ft.Row(
-                        spacing=9,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    pkg["ui_stripe"],
+                    pkg["cb"],
+                    caratula,
+                    ft.Column(
+                        spacing=1,
+                        expand=True,
                         controls=[
-                            pkg["cb"],
-                            pkg["ui_icon"],
-                            ft.Column(
-                                spacing=1,
-                                expand=True,
-                                controls=[
-                                    ft.Text(
-                                        pkg["name"], size=13.5, color=TEXT,
-                                        no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
-                                    ),
-                                ] + ([
-                                    ft.Row(
-                                        spacing=4,
-                                        controls=[
-                                            ft.Icon(ft.Icons.SUBDIRECTORY_ARROW_RIGHT_ROUNDED,
-                                                    size=11, color="#5a616e"),
-                                            ft.Text(
-                                                pkg["sub"], size=11, color="#5a616e",
-                                                no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
-                                            ),
-                                        ],
-                                    )
-                                ] if pkg.get("sub") else []),
-                            ),
-                            pkg["ui_state"],
-                            pkg["ui_pause"], pkg["ui_resume"], pkg["ui_stop"],
-                            ft.Text(human_size(pkg["size"]), size=12, color=MUTED),
+                            ft.Text(titulo, size=13, color=TEXT,
+                                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                            # El nombre de archivo baja a segunda línea: sigue
+                            # siendo lo único que distingue dos volcados del
+                            # mismo juego, pero deja de ser lo primero que se lee.
+                            ft.Text(pkg["name"], size=10.5, color="#69707d",
+                                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                            pkg["ui_bar"],
+                            pkg["ui_detail"],
                         ],
                     ),
-                    pkg["ui_bar"],
-                    pkg["ui_detail"],
+                    # Anchos fijos para las dos columnas de la derecha: sin
+                    # esto un estado largo ("En cola, sin confirmar") empuja al
+                    # tamaño fuera de la fila y queda "34." en vez de "34.5 GB".
+                    ft.Text(human_size(pkg["size"]), size=11.5, color=MUTED,
+                            width=84, no_wrap=True, text_align=ft.TextAlign.RIGHT),
+                    pkg["ui_state"],
+                    pkg["ui_pause"], pkg["ui_resume"], pkg["ui_stop"],
+                    pkg["ui_unqueue"],
                 ],
             ),
         )
         self._paint_row(pkg)
         return row
 
+    def _progress_of(self, pkg):
+        """
+        (bytes hechos, total) para pintar la barra.
+
+        Con datos frescos manda lo que reporta la consola. Cuando está muda
+        (stale), el servidor local es lo único que sabe algo — y sabe bastante:
+        el Range trae el byte exacto.
+        """
+        total = pkg.get("length") or pkg["size"]
+        done = pkg.get("transferred") or 0
+        if pkg.get("stale"):
+            done = max(done, pkg.get("served_pos", 0))
+        return done, total
+
     def _paint_row(self, pkg):
         state = pkg.get("state", "idle")
         label, color, icon = self.STATES.get(state, self.STATES["idle"])
 
         pkg["ui_icon"].name, pkg["ui_icon"].color = icon, color
+        if "ui_stripe" in pkg:
+            pkg["ui_stripe"].bgcolor = self.STRIPE.get(state) or "transparent"
         pkg["ui_state"].value, pkg["ui_state"].color = label, color
 
         active = state in ("preparing", "downloading", "installing", "paused")
@@ -1204,9 +1676,10 @@ class App:
         pkg["ui_pause"].visible = state in ("downloading", "preparing")
         pkg["ui_resume"].visible = state == "paused"
         pkg["ui_stop"].visible = active
+        if "ui_unqueue" in pkg:
+            pkg["ui_unqueue"].visible = state == "pending"
 
-        total = pkg.get("length") or pkg["size"]
-        done = pkg.get("transferred") or 0
+        done, total = self._progress_of(pkg)
         pct = (done / total) if total else 0
 
         if state == "done":
@@ -1221,45 +1694,95 @@ class App:
             bits = [f"{pct*100:.1f}%"]
             if total:
                 bits.append(f"{human_size(done)} de {human_size(total)}")
-            eta = human_eta(pkg.get("rest_sec"))
-            if eta and state == "downloading":
-                bits.append(f"faltan {eta}")
+            if pkg.get("stale"):
+                bits.append(self._detalle_transferencia(pkg))
+            else:
+                eta = human_eta(pkg.get("rest_sec"))
+                if eta and state == "downloading":
+                    bits.append(f"faltan {eta}")
             pkg["ui_detail"].value = "  ·  ".join(bits)
         elif state == "sending":
             pkg["ui_bar"].visible = True
             pkg["ui_bar"].value = None      # indeterminado
             pkg["ui_detail"].value = "Registrando la tarea en la consola…"
+        elif state == "pending":
+            pkg["ui_bar"].visible = False
+            lugar = self.posicion_en_cola(pkg)
+            pkg["ui_detail"].value = f"{lugar}º en la cola" if lugar else "En la cola"
         else:
             pkg["ui_bar"].visible = False
             pkg["ui_detail"].value = pkg.get("error", "")
 
     def refresh_rows(self):
+        if getattr(self, "view_mode", "rows") == "tiles":
+            # Los tiles no tienen controles vivos que repintar: se rearman.
+            self.rebuild_list()
+            self._update_overall()
+            self._safe_update()
+            return
         for pkg in self.pkgs:
             if "ui_bar" in pkg:
                 self._paint_row(pkg)
         self._update_overall()
         self._safe_update()
 
+    def _eta_global(self, got, tot, ahora=None):
+        """
+        Segundos que faltan, medidos sobre el avance real de los últimos
+        minutos. 0 si todavía no hay con qué calcularlo.
+
+        Ventana corta a propósito: la consola alterna entre bajar e instalar y
+        la velocidad cambia mucho, así que un promedio desde el arranque
+        describe una descarga que ya no está pasando.
+        """
+        ahora = time.time() if ahora is None else ahora
+        hist = self._hist_global
+        hist.append((ahora, got))
+        while len(hist) > 1 and ahora - hist[0][0] > self.VENTANA_ETA:
+            hist.pop(0)
+
+        if len(hist) < 2:
+            return 0
+        dt = hist[-1][0] - hist[0][0]
+        db = hist[-1][1] - hist[0][1]
+        if dt < 5 or db <= 0:
+            return 0
+        return (tot - got) / (db / dt)
+
     def _update_overall(self):
-        active = [p for p in self.pkgs
-                  if p.get("state") in ("preparing", "downloading", "installing", "paused")]
-        done = [p for p in self.pkgs if p.get("state") == "done"]
-        if not active and not done:
+        en_juego = [p for p in self.pkgs if p.get("state") in self.EN_JUEGO]
+        listos = [p for p in self.pkgs if p.get("state") == "done"]
+        grupo = en_juego + listos
+        if not grupo:
             self.progress.visible = False
             self.overall.value = ""
+            self._hist_global.clear()
             return
 
         self.progress.visible = True
-        tot = sum((p.get("length") or p["size"]) for p in active + done)
+        tot = sum((p.get("length") or p["size"]) for p in grupo)
+        # Con datos frescos manda la consola; con la API muda —o sea casi
+        # siempre— manda lo que sirvió nuestro servidor. Es la misma cuenta
+        # que hace cada fila: antes acá se sumaba `transferred` a secas y la
+        # barra se quedaba en cero mientras las filas avanzaban.
         got = sum((p.get("length") or p["size"]) if p.get("state") == "done"
-                  else (p.get("transferred") or 0) for p in active + done)
+                  else self._progress_of(p)[0] for p in grupo)
+
         self.progress.value = (got / tot) if tot else None
-        self.overall.value = (
-            f"{len(done)} de {len(active) + len(done)} listos  ·  "
-            f"{human_size(got)} de {human_size(tot)}"
-            + (f"  ·  {len(active)} en curso" if active else "")
-        )
-        self.btn_cancel_all.visible = bool(active)
+
+        partes = [f"{len(listos)} de {len(grupo)} listos",
+                  f"{human_size(got)} de {human_size(tot)}"]
+        activos = [p for p in en_juego
+                   if p.get("state") in ("preparing", "downloading", "installing")]
+        if activos:
+            eta = human_eta(self._eta_global(got, tot))
+            partes.append(f"faltan {eta}" if eta else f"{len(activos)} en curso")
+        esperando = [p for p in en_juego if p.get("state") in ("pending", "waiting")]
+        if esperando:
+            partes.append(f"{len(esperando)} en la cola")
+
+        self.overall.value = "  ·  ".join(partes)
+        self.btn_cancel_all.visible = bool(en_juego)
 
     def _refresh_count(self):
         sel = [p for p in self.pkgs if p["cb"].value]
@@ -1272,6 +1795,103 @@ class App:
 
 
     # ------------------------------------------------------------ servidor
+
+    def _enqueue(self, pkgs):
+        """
+        Suma a la cola los que todavía no están en juego. Devuelve los que
+        entraron de verdad.
+
+        El dedup es por identidad del dict, no por nombre: dos volcados del
+        mismo juego en subcarpetas distintas se llaman igual y son paquetes
+        distintos.
+        """
+        agregados = []
+        with self.queue_lock:
+            for pkg in pkgs:
+                if pkg.get("state") in self.EN_JUEGO:
+                    continue
+                if any(p is pkg for p in self.queue):
+                    continue
+                pkg["state"] = "pending"
+                self.queue.append(pkg)
+                agregados.append(pkg)
+        return agregados
+
+    def _dequeue(self):
+        with self.queue_lock:
+            return self.queue.pop(0) if self.queue else None
+
+    def _claim_worker(self):
+        """
+        ¿Le toca a este hilo arrancar el worker? Si sí, queda reservado.
+
+        `installing` sólo se toca bajo el lock de la cola. Es lo que garantiza
+        que nunca haya dos workers: dos POST /api/install a la vez le dejan a
+        RPI una tarea sin task_id, imposible de seguir o cancelar.
+        """
+        with self.queue_lock:
+            if self.installing:
+                return False
+            self.installing = True
+            return True
+
+    def unqueue(self, pkg):
+        """
+        Saca de la cola un paquete que todavía no salió.
+
+        Sólo aplica a los que esperan: lo que ya está en la consola se da de
+        baja con stop_task, y volver a cero una descarga de horas por
+        equivocación no es algo que deba pasar desde este botón.
+        """
+        with self.queue_lock:
+            if pkg.get("state") != "pending":
+                return
+            self.queue = [p for p in self.queue if p is not pkg]
+        pkg["state"] = "idle"
+        self.log(f"{pkg['name']}: fuera de la cola", "info")
+        self.refresh_rows()
+
+    def posicion_en_cola(self, pkg):
+        """1-based; 0 si no está en la cola."""
+        with self.queue_lock:
+            for i, p in enumerate(self.queue, 1):
+                if p is pkg:
+                    return i
+        return 0
+
+    def _drain_queue(self):
+        """Vacía la cola y devuelve lo que había."""
+        with self.queue_lock:
+            resto, self.queue = self.queue, []
+        return resto
+
+    def set_install_button(self, en_cola):
+        """Con un envío vivo el botón suma a la cola en vez de quedar gris."""
+        icono, texto = self.btn_install.content.controls
+        icono.name = ft.Icons.PLAYLIST_ADD_ROUNDED if en_cola else ft.Icons.DOWNLOAD_ROUNDED
+        texto.value = "Agregar a la cola" if en_cola else "Instalar en la PS4"
+        self.btn_install.disabled = self.httpd is None
+
+    def _publish(self, pkg):
+        """
+        Deja el PKG accesible bajo una ruta plana y ASCII, y la devuelve.
+
+        Medido contra la consola: RPI decodifica el percent-encoding de la URL
+        y arma el request HTTP con el resultado crudo. Un solo espacio en la
+        ruta le parte el request line y falla en 21 ms sin abrir un socket
+        ("Unable to set up prerequisites"). El mismo archivo servido como
+        /p1.pkg entra sin chistar. No es cuestión de codificar mejor: %20 es
+        correcto y falla igual, porque el bug está del lado que decodifica.
+
+        El alias se asigna una sola vez por paquete y nunca se reusa: si fuera
+        por posición en la tanda, reenviar uno solo le robaría la ruta a otro
+        que todavía está descargando.
+        """
+        if not pkg.get("alias"):
+            self._alias_seq = getattr(self, "_alias_seq", 0) + 1
+            pkg["alias"] = f"/p{self._alias_seq}.pkg"
+        PkgHandler.aliases[pkg["alias"]] = pkg["path"]
+        return pkg["alias"]
 
     def start_server(self):
         """Levanta el servidor solo. Si el puerto está ocupado, prueba los siguientes."""
@@ -1404,25 +2024,46 @@ class App:
             self.log(f"{name}: falló sin detalle ({res})", "error")
 
     def poll_task(self, pkg):
-        """Sigue una tarea en la consola hasta que termina o se cancela."""
+        """
+        Sigue una tarea en la consola hasta que termina o se cancela.
+
+        RPI sirve la API y el PKG con el mismo hilo: mientras hay una descarga
+        en curso, /api no contesta absolutamente nada (medido: 12 timeouts de
+        10s seguidos, cero respuestas, con la transferencia avanzando sin
+        problemas). Acá el silencio es lo NORMAL, no una tarea perdida.
+
+        Antes se apagaba el polling a los 3 fallos y el paquete quedaba en
+        "unknown": la fila se veía como si no se hubiera enviado nada, para
+        siempre y sin un mensaje que lo explicara. Ahora reintenta con backoff
+        y marca el paquete como "stale", así la UI puede seguir mostrando el
+        avance que reporta el servidor HTTP local (ver _on_download).
+        """
         tid = pkg["task_id"]
         stagnant = 0
         last_seen = -1
+        aviso_dado = False
 
         while pkg.get("polling") and not self.stopping:
             res = self.rpi_call("get_task_progress", {"task_id": tid}, timeout=10) or {}
 
             if str(res.get("status", "")).lower() != "success":
                 stagnant += 1
-                if stagnant >= 3:
-                    pkg["polling"] = False
-                    if pkg["state"] not in ("done", "cancelled"):
-                        pkg["state"] = "unknown"
-                    self.refresh_rows()
-                    return
-                time.sleep(2)
+                pkg["stale"] = True
+                if stagnant == 3 and not aviso_dado:
+                    aviso_dado = True
+                    self.log(
+                        f"{pkg['name']}: la consola no contesta la API mientras "
+                        f"descarga. Sigo el avance por el servidor local.", "warn"
+                    )
+                self.refresh_rows()
+                # Martillar una consola saturada no la despierta antes.
+                time.sleep(min(2 * stagnant, POLL_MAX_BACKOFF))
                 continue
+
+            if stagnant and aviso_dado:
+                self.log(f"{pkg['name']}: la consola volvió a contestar", "ok")
             stagnant = 0
+            pkg["stale"] = False
 
             total = res.get("length_total") or res.get("length") or pkg["size"]
             done = res.get("transferred_total") or res.get("transferred") or 0
@@ -1455,19 +2096,171 @@ class App:
             self.refresh_rows()
             time.sleep(2)
 
+    _RE_RANGE_START = re.compile(r"bytes=(\d+)-")
+
     def _on_download(self, path, rng=None):
-        name = urllib.parse.unquote(os.path.basename(path)) or path
-        if rng:
-            self.log(f"La PS4 pide {rng} de {name}", "step")
-        else:
+        """
+        Cada pedido que atiende el servidor local.
+
+        Además de loguear, de acá sale el progreso de verdad: el header Range
+        dice en qué byte va la consola. Es la única fuente que sigue viva
+        durante la transferencia — la API de RPI queda muda mientras descarga,
+        así que sin esto la barra no se movería nunca.
+        """
+        # El pedido viene por el alias (/p1.pkg), no por el nombre real, y la
+        # consola le cuelga su propia query: ?downloadId=...&threadId=...
+        clean = urllib.parse.unquote(path.split("?", 1)[0])
+        pkg = next((p for p in self.pkgs if p.get("alias") == clean), None)
+        name = pkg["name"] if pkg else (os.path.basename(clean) or path)
+
+        if not rng:
             self.log(f"La PS4 está descargando {name}", "step")
+            return
+
+        m = self._RE_RANGE_START.match(rng.strip())
+        if not m or not pkg:
+            return
+        start = int(m.group(1))
+
+        # La consola pide rangos fuera de orden (header, sfo, icono):
+        # nos quedamos con la marca más alta alcanzada, nunca retrocede.
+        if start > pkg.get("served_pos", 0):
+            pkg["served_pos"] = start
+            self.refresh_rows()
+
+        # Antes cada rango servido escribía su propia línea: docenas por
+        # paquete, todas casi iguales, y los mensajes que importan se
+        # ahogaban. Ahora es una línea de avance cada 15 segundos.
+        ahora = time.time()
+        if ahora - pkg.get("last_log", 0) >= 15:
+            pkg["last_log"] = ahora
+            hechos, total = self._progress_of(pkg)
+            self.log(
+                f"{pkg.get('title') or name} · {human_size(hechos)} de "
+                f"{human_size(total)} servidos", "step",
+            )
+
+    def _on_served(self, path, pos):
+        """
+        Bytes que salieron de verdad hacia la consola.
+
+        _on_download marca el arranque de cada rango; esto marca el avance
+        dentro del rango. Sin lo segundo la barra se queda corta por el tamaño
+        del último chunk —medido en un envío real: el update paró de moverse en
+        "6.6 GB de 6.8 GB" y se quedó en 97% con la descarga ya terminada.
+        """
+        clean = urllib.parse.unquote(path.split("?", 1)[0])
+        pkg = next((p for p in self.pkgs if p.get("alias") == clean), None)
+        if not pkg or pos <= pkg.get("served_pos", 0):
+            return
+
+        pkg["served_pos"] = pos
+        # Repintar en cada aviso sería repintar cada 8 MB durante horas.
+        ahora = time.time()
+        if ahora - pkg.get("last_paint", 0) >= 1:
+            pkg["last_paint"] = ahora
+            self.refresh_rows()
+
+    def _detalle_transferencia(self, pkg):
+        """Qué decir cuando la barra se alimenta del servidor local."""
+        hechos, total = self._progress_of(pkg)
+        if total and hechos >= total:
+            # Ya no falta nada por transferir, y lo que falta —que la consola
+            # termine de instalar— no lo sabemos: no contesta la API.
+            return "Transferido entero · la consola está terminando"
+        return "avance medido en el servidor local"
+
+    # ------------------------------------------------------------ extracción
+
+    def on_extract(self, _):
+        if self.extracting or not self.archives:
+            return
+        self.extracting = True
+        self.btn_extract.disabled = True
+        self.arch_bar.visible = True
+        self.arch_bar.value = None
+        self._safe_update()
+        threading.Thread(target=self._extract_worker, daemon=True).start()
+
+    def _extract_worker(self):
+        """
+        Extrae la tanda entera. Corre en thread aparte: 70 GB de escritura no
+        pueden bloquear la ventana ni el servidor que le sirve a la consola.
+        """
+        pwd = (self.f_pass.value or "").strip()
+        borrar = self.cb_delete_archives.value
+        pendientes = list(self.archives)
+        hechos = 0
+
+        try:
+            # Medimos todo antes de escribir un byte: mejor frenar ahora que
+            # quedarse sin disco a los 40 GB y dejar un .pkg corrupto.
+            necesario = 0
+            for a in pendientes:
+                try:
+                    necesario += archives.inspect_archive(a, pwd).unpacked_size
+                except archives.WrongPassword:
+                    self.log(f"{a.name}: contraseña incorrecta", "error")
+                    return
+                except Exception as e:
+                    self.log(f"{a.name}: no pude leerlo ({e})", "error")
+                    return
+
+            alcanza, libre = archives.check_space(self.folder, necesario)
+            if not alcanza:
+                self.log(
+                    f"No hay espacio: hacen falta {human_size(necesario)} y "
+                    f"quedan {human_size(libre)} libres", "error",
+                )
+                return
+
+            self.log(
+                f"Extrayendo {len(pendientes)} comprimido(s) · "
+                f"{human_size(necesario)} al terminar", "step",
+            )
+
+            for idx, a in enumerate(pendientes, 1):
+                dest = os.path.join(os.path.dirname(a.path), a.name)
+
+                def progreso(pct, nombre=a.name, i=idx, n=len(pendientes)):
+                    self.arch_bar.value = ((i - 1) + pct) / n
+                    self.arch_text.value = f"Extrayendo {nombre}  ·  {pct * 100:.0f}%  ({i}/{n})"
+                    self._safe_update()
+
+                try:
+                    archives.extract(a, dest, pwd, on_progress=progreso)
+                except archives.WrongPassword:
+                    self.log(f"{a.name}: contraseña incorrecta", "error")
+                    return
+                except Exception as e:
+                    self.log(f"{a.name}: falló la extracción ({e})", "error")
+                    return
+
+                hechos += 1
+                self.log(f"{a.name}: extraído", "ok")
+
+                if borrar:
+                    for parte in a.parts:
+                        try:
+                            os.remove(parte)
+                        except OSError as e:
+                            self.log(
+                                f"No pude borrar {os.path.basename(parte)}: {e}", "warn"
+                            )
+
+        finally:
+            self.extracting = False
+            self.arch_bar.visible = False
+            self.btn_extract.disabled = False
+            if hechos:
+                self.log(f"{hechos} comprimido(s) extraído(s)", "ok")
+            # Re-escanear: los .pkg nuevos entran solos a la lista de siempre.
+            self.scan_folder()
+            self._safe_update()
 
     # ------------------------------------------------------------ instalación
 
     def on_install(self, _):
-        if self.installing:
-            return
-
         ip = (self.f_ps4.value or "").strip()
         if not ip:
             self.log("Falta la IP de la PS4", "error")
@@ -1475,14 +2268,86 @@ class App:
 
         selected = [p for p in self.pkgs if p["cb"].value]
         if not selected:
-            self.log("No seleccionaste ningún paquete", "warn")
+            # Dos causas muy distintas bajo el mismo mensaje: se vio en un log
+            # real "No seleccionaste ningún paquete" con la lista mostrando
+            # todo tildado, y así no hay forma de saber cuál de las dos fue.
+            if not self.pkgs:
+                self.log("La lista está vacía: no hay paquetes para enviar", "warn")
+            else:
+                self.log(f"Ninguno de los {len(self.pkgs)} paquetes está tildado", "warn")
             return
 
-        threading.Thread(target=self._install_worker, args=(ip, selected), daemon=True).start()
+        nuevos = self._enqueue(selected)
+        if not nuevos:
+            self.log("Todo lo tildado ya está en la cola o enviado", "warn")
+            return
 
-    def _install_worker(self, ip, packages):
+        if not self._claim_worker():
+            # Hay un worker vivo: se lo lleva él. Arrancar un segundo sería
+            # mandarle dos installs a la vez a RPI, que atiende de a uno.
+            delante = len(self.queue) - len(nuevos)
+            cuantos = f"{len(nuevos)} paquete(s)"
+            self.log(
+                f"{cuantos} a la cola" + (f" ({delante} por delante)" if delante else ""),
+                "ok",
+            )
+            self.refresh_rows()
+            return
+
+        threading.Thread(target=self._install_worker, args=(ip,), daemon=True).start()
+
+    def _wait_for_console(self, ip, pkg):
+        """
+        Espera a que la consola vuelva a atender la API antes del próximo envío.
+
+        RPI sirve la API y los PKG con el mismo hilo: mientras descarga no
+        contesta /api. Mandarle el install igual no lo rechaza — lo encola y la
+        respuesta con el task_id nunca llega, así que queda una tarea que no se
+        puede seguir ni cancelar. Esperar el turno no alarga la descarga (el
+        ancho de banda es el mismo), solo conserva el control.
+
+        Devuelve True si la consola está lista, False si hay que abortar.
+        """
+        if self.ps4_state(ip, timeout=8) == "ok":
+            return True
+
+        pkg["state"] = "waiting"
+        self.refresh_rows()
+        self.log(f"{pkg['name']}: espero a que la consola se libere…", "step")
+
+        caidas = 0
+        while not self.stopping:
+            estado = self.ps4_state(ip, timeout=8)
+            if estado == "ok":
+                self.log(f"{pkg['name']}: la consola se liberó", "ok")
+                return True
+            if estado == "down":
+                # "busy" es una consola trabajando y se espera. "down" es que no
+                # hay nadie en el puerto; un pico aislado se tolera, tres no.
+                caidas += 1
+                if caidas >= 3:
+                    self.log(
+                        f"{pkg['name']}: la consola dejó de responder en {ip}. Corto el envío.",
+                        "error",
+                    )
+                    return False
+            else:
+                caidas = 0
+            time.sleep(POLL_MAX_BACKOFF)
+
+        return False
+
+    def _install_worker(self, ip):
+        """
+        Vacía la cola, de a un paquete y esperando turno.
+
+        Uno solo de estos corre a la vez: dos POST /api/install simultáneos es
+        justo lo que deja tareas huérfanas. Lo que sí puede pasar en cualquier
+        momento es que le agreguen paquetes a la cola mientras trabaja — por
+        eso la lee en cada vuelta en vez de recibir una lista cerrada.
+        """
         self.installing = True
-        self.btn_install.disabled = True
+        self.set_install_button(en_cola=True)
         self.progress.visible = True
         self.progress.value = None      # indeterminado
         self._safe_update()
@@ -1495,31 +2360,44 @@ class App:
                 self.set_chip(self.chip_ps4, "PS4 no responde", RED, ft.Icons.ERROR)
                 return
             if state == "busy":
-                self.log("La app de la consola no contesta. Cancelo para no encolar.", "error")
-                self.log("Cerrala y volvé a abrirla en la PS4, después reintentá.", "info")
-                self.set_chip(self.chip_ps4, "PS4 trabada", AMBER, ft.Icons.WARNING_ROUNDED)
-                return
-            self.set_chip(self.chip_ps4, "PS4 lista", GREEN, ft.Icons.CHECK_CIRCLE)
+                # NO se aborta: que la consola esté bajando algo es lo normal,
+                # no un error. Antes moría acá con "Cancelo para no encolar" y
+                # no había forma de sumar un paquete sin abrir otra instancia.
+                self.log("La consola está ocupada; espero turno para cada envío.", "info")
+                self.set_chip(self.chip_ps4, "PS4 ocupada", AMBER, ft.Icons.HOURGLASS_TOP_ROUNDED)
+            else:
+                self.set_chip(self.chip_ps4, "PS4 lista", GREEN, ft.Icons.CHECK_CIRCLE)
 
             local = self.f_local.value
             port = self.f_port.value
-            total = len(packages)
+            i = 0
             ok_count = 0
+            enviados = []
 
-            for i, pkg in enumerate(packages, 1):
-                if self.stopping:
-                    self.log("Envío interrumpido", "warn")
+            while not self.stopping:
+                pkg = self._dequeue()
+                if pkg is None:
                     break
+                i += 1
+                total = i + len(self.queue)   # se mueve: pueden sumar más
+                enviados.append(pkg)
 
                 name = pkg["name"]
+
+                # RPI no atiende /api mientras descarga. Mandar igual encola una
+                # tarea cuyo id nunca llega: queda huérfana, sin forma de
+                # seguirla ni cancelarla. Esperamos el turno.
+                if not self._wait_for_console(ip, pkg):
+                    self.log("Corto el envío. Los que faltan quedan sin enviar.", "warn")
+                    break
+
                 pkg["state"] = "sending"
                 pkg["error"] = ""
                 self.refresh_rows()
 
-                # quote con safe="/" mantiene los separadores del subdirectorio
-                # y escapa el resto (espacios, corchetes, acentos).
-                rel_url = urllib.parse.quote(pkg.get("rel", name).replace(os.sep, "/"), safe="/")
-                url = f"http://{local}:{port}/{rel_url}"
+                # La URL no lleva el nombre real: RPI se atraganta con los
+                # espacios (y todo lo demás) por más que vayan escapados.
+                url = f"http://{local}:{port}{self._publish(pkg)}"
                 self.log(f"[{i}/{total}] Enviando {name}", "step")
 
                 body = json.dumps({"type": "direct", "packages": [url]}).encode()
@@ -1540,10 +2418,17 @@ class App:
                 except urllib.error.HTTPError as e:
                     self._handle_install_reply(pkg, parse_rpi_json(e.read()))
                 except socket.timeout:
-                    pkg["state"] = "error"
-                    pkg["error"] = f"sin respuesta en {INSTALL_TIMEOUT}s"
-                    self.log(f"{name}: la consola no contestó en {INSTALL_TIMEOUT} s", "error")
-                    self.log("La app quedó procesando. Reiniciala en la consola.", "info")
+                    # No es un fallo: el pedido llegó y RPI lo procesa cuando
+                    # puede, así que la tarea casi seguro existe. Lo que se
+                    # perdió es el task_id, no el paquete.
+                    pkg["state"] = "queued"
+                    pkg["error"] = "la consola no confirmó; probablemente esté en cola"
+                    self.log(f"{name}: sin confirmación en {INSTALL_TIMEOUT} s", "warn")
+                    self.log(
+                        "Lo más probable es que igual haya quedado en cola. No cierres "
+                        "la app ni reinicies la consola: cortarías las descargas en curso.",
+                        "info",
+                    )
                 except urllib.error.URLError as e:
                     pkg["state"] = "error"
                     pkg["error"] = str(e.reason)
@@ -1555,29 +2440,72 @@ class App:
 
                 self.refresh_rows()
 
-                if i < total and not self.stopping:
+                if self.queue and not self.stopping:
                     time.sleep(3)
 
+            total = len(enviados)
+            if not total:
+                return
+            sin_confirmar = sum(1 for p in enviados if p.get("state") == "queued")
             if ok_count == total:
                 self.log(f"{ok_count} de {total} en cola. Seguí el progreso acá arriba.", "ok")
-            elif ok_count:
-                self.log(f"{ok_count} de {total} aceptados, el resto falló.", "warn")
+            elif ok_count or sin_confirmar:
+                partes = []
+                if ok_count:
+                    partes.append(f"{ok_count} confirmado(s)")
+                if sin_confirmar:
+                    partes.append(f"{sin_confirmar} sin confirmar")
+                self.log(f"{' y '.join(partes)} de {total}.", "warn")
             else:
                 self.log("La consola rechazó todos los paquetes.", "error")
 
         finally:
-            self.installing = False
-            self.btn_install.disabled = self.httpd is None
+            # El pedido de corte ya se cumplió: si queda arriba, el próximo
+            # envío se abortaría solo y sin decir por qué.
+            corte = self.stopping
+            self.stopping = False
+
+            # Alguien puede haber encolado entre la última vuelta del while y
+            # este finally. Si quedó algo, `installing` NO baja —así nadie
+            # arranca un segundo worker— y este deja un relevo.
+            with self.queue_lock:
+                relevo = bool(self.queue) and not corte
+                if not relevo:
+                    self.installing = False
+
+            if relevo:
+                threading.Thread(
+                    target=self._install_worker, args=(ip,), daemon=True
+                ).start()
+                return
+
+            # Lo que quedó sin mandar vuelve a "idle": si se quedara en
+            # "pending" no se podría re-encolar nunca (EN_JUEGO lo filtra).
+            for pkg in self._drain_queue():
+                pkg["state"] = "idle"
+            self.set_install_button(en_cola=False)
             self.refresh_rows()
 
     def on_cancel_all(self, _):
         """Corta el envío en curso y manda stop_task a todo lo que esté activo."""
         self.stopping = True
+
+        # Lo que todavía no salió se descarta acá: no tiene task_id, así que
+        # no hay nada que darle de baja a la consola.
+        for pkg in self._drain_queue():
+            pkg["state"] = "idle"
+
         active = [p for p in self.pkgs
                   if p.get("task_id") is not None
                   and p.get("state") in ("preparing", "downloading", "installing", "paused")]
 
         if not active:
+            if self.installing:
+                # Todavía no hay ningún task_id que dar de baja, pero el envío
+                # está en curso (esperando turno, o entre paquete y paquete).
+                # `stopping` queda arriba: lo baja _install_worker al cortar.
+                self.log("Corto el envío en curso", "warn")
+                return
             self.log("No hay tareas activas para cancelar", "info")
             self.stopping = False
             return

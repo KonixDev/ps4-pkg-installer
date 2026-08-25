@@ -4,5 +4,9 @@ __pycache__/
 build/
 dist/
 *.spec
+!PS4 PKG Installer.spec
 .DS_Store
 .venv/
+vendor/
+dist-nuevo/
+assets/preview.png

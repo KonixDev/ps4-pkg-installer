@@ -110,7 +110,13 @@ pyinstaller --onefile --windowed --name "PS4 PKG Installer" \
 - `Servidor :8000` — el servidor local de archivos. Arranca solo, no hay botón. Si el puerto está ocupado prueba los siguientes y te dice con cuál se quedó.
 - `PS4 lista` — la consola. Ver abajo.
 
-**4. Tildá los paquetes que quieras y tocá Instalar.**
+**4. ¿Hay comprimidos sin extraer?** Si en la carpeta hay archivos `.rar`, `.zip` o `.7z`, arriba de la lista aparece un banner con cuántos son y cuánto pesan. Escribí la contraseña si el release la pide y tocá *Extraer*: cuando termina, los `.pkg` entran solos a la lista de abajo.
+
+Los releases partidos en volúmenes (`.part1.rar`, `.part2.rar`, …) se listan como una sola entrada — alcanza con tener todas las partes en la misma carpeta. Si falta alguna, el botón queda deshabilitado y el log dice cuál. Antes de empezar se calcula el espacio necesario: si no entra, avisa en vez de dejar un `.pkg` a medias. La casilla *borrar los comprimidos al terminar* viene apagada.
+
+Adentro hay dos extractores. El que hace el trabajo es 7-Zip, que viaja bundleado; pero 7-Zip lee los headers de cualquier RAR5 y no implementa todos los codecs de compresión, así que con un RAR comprimido de verdad lista el contenido perfecto y muere recién al descomprimir, con `Unsupported Method`. Cuando eso pasa se reintenta con `unar` (o `unrar`, si lo tenés), que también va bundleado. La mayoría de los releases usan RAR en modo *store* — un PKG ya viene comprimido y cifrado, volver a comprimirlo no achica nada — pero cuando aparece uno comprimido, sin el segundo motor no hay forma de abrirlo.
+
+**5. Tildá los paquetes que quieras y tocá Instalar.**
 
 Cada fila pasa a mostrar su propio estado, barra de progreso, porcentaje, bytes transferidos y tiempo restante, con botones de pausa y cancelación. La consola baja varios paquetes a la vez, así que vas a ver varias filas avanzando juntas.
 
@@ -137,6 +143,10 @@ Un chequeo por `connect()` TCP te dice "conectado" contra una app completamente 
 `/api/install` devuelve un `task_id`. Con eso, la herramienta consulta `/api/get_task_progress` para obtener la visión que tiene la propia consola de la transferencia — bytes movidos, segundos restantes, porcentaje de descompresión — y por eso las fases se leen como *Preparando → Descargando → Instalando* en vez de una sola barra indistinta. *Instalando* es el `local_copy_percent`: la consola descomprimiendo una vez que los bytes ya llegaron.
 
 Ese mismo `task_id` alimenta `/api/pause_task`, `/api/resume_task` y `/api/stop_task`, de donde salen los botones de cada fila y el *Cancelar todo*.
+
+**Cuando la consola se queda muda.** RPI atiende la API y sirve el PKG con el mismo hilo, así que mientras hay una transferencia grande en curso `/api/get_task_progress` deja de contestar por completo — medido: doce timeouts de diez segundos seguidos, cero respuestas, con la descarga avanzando sin problemas. Acá el silencio es lo normal, no una tarea perdida.
+
+Por eso el progreso tiene dos fuentes. Mientras la consola contesta, manda ella. Cuando se queda muda, la barra pasa a moverse con lo que ve el servidor HTTP local: cada `Range` que pide la PS4 trae el byte exacto en el que va, y esa fuente no puede saturarse porque es la propia máquina. La fila lo aclara con *avance medido en el servidor local* y esconde el tiempo restante, que a esa altura sería un dato viejo.
 
 **Una advertencia:** las respuestas de RPI no son JSON válido. Escribe los enteros como literales hexadecimales:
 

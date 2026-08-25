@@ -1,0 +1,7 @@
+pytest>=8,<9
+
+# Corriendo desde fuente hace falta el CLI de 7-Zip en el sistema:
+#   macOS  brew install sevenzip
+#   Linux  apt install p7zip-full
+# En los ejecutables que compila el CI el binario viaja bundleado, así que
+# el usuario final no instala nada.
