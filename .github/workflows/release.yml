@@ -103,8 +103,17 @@ jobs:
           # El separador de --add-binary es ';' en Windows y ':' en el resto.
           if [ "${{ runner.os }}" = "Windows" ]; then
             SEP=";"; SEVENZIP="vendor/7za.exe"; FALLBACK="vendor/unrar.exe"
+            ICONO="assets/icon.ico"
           else
             SEP=":"; SEVENZIP="vendor/7zz"; FALLBACK="vendor/unar"
+            # macOS quiere .icns; Linux no usa icono embebido y lo ignora.
+            ICONO="assets/icon.icns"
+          fi
+          # Los iconos van versionados a propósito: generarlos acá obligaría a
+          # instalar Pillow en el runner. Se regeneran con tools/make_icon.py.
+          if [ ! -f "$ICONO" ]; then
+            echo "::error::Falta $ICONO — corré tools/make_icon.py y commiteá assets/"
+            exit 1
           fi
           EXTRA=""
           # El respaldo es opcional: si su descarga falló, se compila sin él.
@@ -115,6 +124,8 @@ jobs:
           fi
           pyinstaller --noconfirm --onefile --windowed \
             --name "PS4 PKG Installer" \
+            --icon "$ICONO" \
+            --osx-bundle-identifier dev.konix.ps4-pkg-installer \
             --collect-all flet \
             --collect-all flet_desktop \
             --add-binary "${SEVENZIP}${SEP}." \
