@@ -48,21 +48,35 @@ jobs:
 
       - name: Fetch the 7-Zip CLI
         shell: bash
+        env:
+          # Las descargas salen del repo oficial en GitHub y no de 7-zip.org/a/:
+          # ese directorio guarda una sola versión y devuelve 404 apenas sale la
+          # siguiente, así que ataba cada release a que nadie publicara nada.
+          SEVENZIP: "25.01"
         run: |
           set -euo pipefail
           mkdir -p vendor
+          BASE="https://github.com/ip7z/7zip/releases/download/${SEVENZIP}"
+          TAG="7z$(echo "$SEVENZIP" | tr -d .)"
           case "${{ runner.os }}" in
             macOS)
-              curl -fsSL https://www.7-zip.org/a/7z2408-mac.tar.xz -o 7z.tar.xz
+              curl -fsSL "$BASE/${TAG}-mac.tar.xz" -o 7z.tar.xz
               tar -xf 7z.tar.xz 7zz && mv 7zz vendor/7zz && chmod +x vendor/7zz
               ;;
             Linux)
-              curl -fsSL https://www.7-zip.org/a/7z2408-linux-x64.tar.xz -o 7z.tar.xz
+              curl -fsSL "$BASE/${TAG}-linux-x64.tar.xz" -o 7z.tar.xz
               tar -xf 7z.tar.xz 7zz && mv 7zz vendor/7zz && chmod +x vendor/7zz
               ;;
             Windows)
-              curl -fsSL https://www.7-zip.org/a/7z2408-extra.7z -o 7z.7z
-              7z x 7z.7z -ovendor 7za.exe
+              # El 7-Zip COMPLETO (7z.exe + su 7z.dll), no el 7za.exe del paquete
+              # Extra: ese es la versión de formatos reducidos y no lee RAR, que
+              # es como viene casi todo release de PS4. En mac y Linux el binario
+              # `7zz` ya es el completo; esto pone a Windows a la par.
+              # 7zr.exe es un extractor mínimo y autónomo, solo para abrir el
+              # instalador de 7-Zip, que adentro trae el 7z.exe que queremos.
+              curl -fsSL "$BASE/7zr.exe" -o 7zr.exe
+              curl -fsSL "$BASE/${TAG}-x64.exe" -o 7zsetup.exe
+              ./7zr.exe x 7zsetup.exe -ovendor -y 7z.exe 7z.dll
               ;;
           esac
           ls -l vendor/
@@ -89,10 +103,14 @@ jobs:
               ;;
             Windows)
               # RARLAB no publica un zip pelado del unrar de Windows: viene
-              # dentro del instalador autoextraíble, que 7-Zip sabe abrir.
+              # dentro de un autoextraíble que es, justamente, un RAR con el
+              # método que 7-Zip no sabe descomprimir (deja un .exe de 0 bytes).
+              # Así que en vez de abrirlo, se lo corre: "-s" es sin ventanas y
+              # "-d" elige a dónde deja los archivos.
               curl -fsSL https://www.rarlab.com/rar/unrarw64.exe -o unrarw64.exe
-              7z x unrarw64.exe -ovendor UnRAR.exe
-              mv vendor/UnRAR.exe vendor/unrar.exe
+              ./unrarw64.exe -s -d"$(pwd -W)\\unrarbin"
+              cp unrarbin/UnRAR.exe vendor/unrar.exe
+              [ -s vendor/unrar.exe ]
               ;;
           esac
           ls -l vendor/
@@ -101,9 +119,13 @@ jobs:
         shell: bash
         run: |
           # El separador de --add-binary es ';' en Windows y ':' en el resto.
+          EXTRA_LIB=""
           if [ "${{ runner.os }}" = "Windows" ]; then
-            SEP=";"; SEVENZIP="vendor/7za.exe"; FALLBACK="vendor/unrar.exe"
+            SEP=";"; SEVENZIP="vendor/7z.exe"; FALLBACK="vendor/unrar.exe"
             ICONO="assets/icon.ico"
+            # 7z.exe no hace nada sin su DLL al lado: --onefile las descomprime
+            # juntas en la carpeta temporal donde archives.py las busca.
+            EXTRA_LIB="--add-binary vendor/7z.dll${SEP}."
           else
             SEP=":"; SEVENZIP="vendor/7zz"; FALLBACK="vendor/unar"
             # macOS quiere .icns; Linux no usa icono embebido y lo ignora.
@@ -129,6 +151,7 @@ jobs:
             --collect-all flet \
             --collect-all flet_desktop \
             --add-binary "${SEVENZIP}${SEP}." \
+            $EXTRA_LIB \
             $EXTRA \
             ps4_pkg_installer.py
 
