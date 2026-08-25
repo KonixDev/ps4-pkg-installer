@@ -10,3 +10,5 @@ dist/
 vendor/
 dist-nuevo/
 assets/preview.png
+build-win/
+.venv-build/
