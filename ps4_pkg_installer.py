@@ -391,6 +391,8 @@ class PkgHandler(SimpleHTTPRequestHandler):
 class App:
     # Un paquete en cualquiera de estos ya está en juego: volver a encolarlo
     # sería mandarlo dos veces.
+    VENTANA_ETA = 120       # segundos de historia para estimar la velocidad
+
     EN_JUEGO = frozenset({
         "pending", "sending", "waiting", "queued",
         "preparing", "downloading", "installing", "paused",
@@ -403,6 +405,7 @@ class App:
         self.pkgs = []          # [{path, name, size, cb}]
         self.queue = []         # paquetes esperando su turno de envío
         self.queue_lock = threading.Lock()
+        self._hist_global = []  # [(t, bytes)] para estimar cuánto falta
         self.archives = []      # comprimidos sin extraer en la carpeta
         self.installing = False
         self.extracting = False
@@ -1567,7 +1570,8 @@ class App:
 
     def _build_row(self, pkg):
         """Fila con estado, barra de progreso y controles de la tarea."""
-        pkg["ui_state"] = ft.Text("", size=12, color=MUTED)
+        pkg["ui_state"] = ft.Text("", size=12, color=MUTED, width=118,
+                                  no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS)
         pkg["ui_icon"] = ft.Icon(ft.Icons.CIRCLE_OUTLINED, size=16, color=MUTED)
         pkg["ui_detail"] = ft.Text("", size=11.5, color=MUTED)
         pkg["ui_bar"] = ft.ProgressBar(
@@ -1584,6 +1588,11 @@ class App:
         pkg["ui_stop"] = ft.IconButton(
             ft.Icons.STOP_ROUNDED, icon_size=17, icon_color=RED, visible=False,
             tooltip="Cancelar", on_click=lambda _, p=pkg: self.task_action(p, "stop_task"),
+        )
+        pkg["ui_unqueue"] = ft.IconButton(
+            ft.Icons.REMOVE_CIRCLE_OUTLINE_ROUNDED, icon_size=17, icon_color=MUTED,
+            visible=False, tooltip="Sacar de la cola",
+            on_click=lambda _, p=pkg: self.unqueue(p),
         )
 
         pkg["ui_stripe"] = ft.Container(width=3, height=38, border_radius=2,
@@ -1625,10 +1634,14 @@ class App:
                             pkg["ui_detail"],
                         ],
                     ),
+                    # Anchos fijos para las dos columnas de la derecha: sin
+                    # esto un estado largo ("En cola, sin confirmar") empuja al
+                    # tamaño fuera de la fila y queda "34." en vez de "34.5 GB".
                     ft.Text(human_size(pkg["size"]), size=11.5, color=MUTED,
-                            width=72, text_align=ft.TextAlign.RIGHT),
+                            width=84, no_wrap=True, text_align=ft.TextAlign.RIGHT),
                     pkg["ui_state"],
                     pkg["ui_pause"], pkg["ui_resume"], pkg["ui_stop"],
+                    pkg["ui_unqueue"],
                 ],
             ),
         )
@@ -1663,6 +1676,8 @@ class App:
         pkg["ui_pause"].visible = state in ("downloading", "preparing")
         pkg["ui_resume"].visible = state == "paused"
         pkg["ui_stop"].visible = active
+        if "ui_unqueue" in pkg:
+            pkg["ui_unqueue"].visible = state == "pending"
 
         done, total = self._progress_of(pkg)
         pct = (done / total) if total else 0
@@ -1690,6 +1705,10 @@ class App:
             pkg["ui_bar"].visible = True
             pkg["ui_bar"].value = None      # indeterminado
             pkg["ui_detail"].value = "Registrando la tarea en la consola…"
+        elif state == "pending":
+            pkg["ui_bar"].visible = False
+            lugar = self.posicion_en_cola(pkg)
+            pkg["ui_detail"].value = f"{lugar}º en la cola" if lugar else "En la cola"
         else:
             pkg["ui_bar"].visible = False
             pkg["ui_detail"].value = pkg.get("error", "")
@@ -1707,26 +1726,63 @@ class App:
         self._update_overall()
         self._safe_update()
 
+    def _eta_global(self, got, tot, ahora=None):
+        """
+        Segundos que faltan, medidos sobre el avance real de los últimos
+        minutos. 0 si todavía no hay con qué calcularlo.
+
+        Ventana corta a propósito: la consola alterna entre bajar e instalar y
+        la velocidad cambia mucho, así que un promedio desde el arranque
+        describe una descarga que ya no está pasando.
+        """
+        ahora = time.time() if ahora is None else ahora
+        hist = self._hist_global
+        hist.append((ahora, got))
+        while len(hist) > 1 and ahora - hist[0][0] > self.VENTANA_ETA:
+            hist.pop(0)
+
+        if len(hist) < 2:
+            return 0
+        dt = hist[-1][0] - hist[0][0]
+        db = hist[-1][1] - hist[0][1]
+        if dt < 5 or db <= 0:
+            return 0
+        return (tot - got) / (db / dt)
+
     def _update_overall(self):
-        active = [p for p in self.pkgs
-                  if p.get("state") in ("preparing", "downloading", "installing", "paused")]
-        done = [p for p in self.pkgs if p.get("state") == "done"]
-        if not active and not done:
+        en_juego = [p for p in self.pkgs if p.get("state") in self.EN_JUEGO]
+        listos = [p for p in self.pkgs if p.get("state") == "done"]
+        grupo = en_juego + listos
+        if not grupo:
             self.progress.visible = False
             self.overall.value = ""
+            self._hist_global.clear()
             return
 
         self.progress.visible = True
-        tot = sum((p.get("length") or p["size"]) for p in active + done)
+        tot = sum((p.get("length") or p["size"]) for p in grupo)
+        # Con datos frescos manda la consola; con la API muda —o sea casi
+        # siempre— manda lo que sirvió nuestro servidor. Es la misma cuenta
+        # que hace cada fila: antes acá se sumaba `transferred` a secas y la
+        # barra se quedaba en cero mientras las filas avanzaban.
         got = sum((p.get("length") or p["size"]) if p.get("state") == "done"
-                  else (p.get("transferred") or 0) for p in active + done)
+                  else self._progress_of(p)[0] for p in grupo)
+
         self.progress.value = (got / tot) if tot else None
-        self.overall.value = (
-            f"{len(done)} de {len(active) + len(done)} listos  ·  "
-            f"{human_size(got)} de {human_size(tot)}"
-            + (f"  ·  {len(active)} en curso" if active else "")
-        )
-        self.btn_cancel_all.visible = bool(active)
+
+        partes = [f"{len(listos)} de {len(grupo)} listos",
+                  f"{human_size(got)} de {human_size(tot)}"]
+        activos = [p for p in en_juego
+                   if p.get("state") in ("preparing", "downloading", "installing")]
+        if activos:
+            eta = human_eta(self._eta_global(got, tot))
+            partes.append(f"faltan {eta}" if eta else f"{len(activos)} en curso")
+        esperando = [p for p in en_juego if p.get("state") in ("pending", "waiting")]
+        if esperando:
+            partes.append(f"{len(esperando)} en la cola")
+
+        self.overall.value = "  ·  ".join(partes)
+        self.btn_cancel_all.visible = bool(en_juego)
 
     def _refresh_count(self):
         sel = [p for p in self.pkgs if p["cb"].value]
@@ -1778,6 +1834,30 @@ class App:
                 return False
             self.installing = True
             return True
+
+    def unqueue(self, pkg):
+        """
+        Saca de la cola un paquete que todavía no salió.
+
+        Sólo aplica a los que esperan: lo que ya está en la consola se da de
+        baja con stop_task, y volver a cero una descarga de horas por
+        equivocación no es algo que deba pasar desde este botón.
+        """
+        with self.queue_lock:
+            if pkg.get("state") != "pending":
+                return
+            self.queue = [p for p in self.queue if p is not pkg]
+        pkg["state"] = "idle"
+        self.log(f"{pkg['name']}: fuera de la cola", "info")
+        self.refresh_rows()
+
+    def posicion_en_cola(self, pkg):
+        """1-based; 0 si no está en la cola."""
+        with self.queue_lock:
+            for i, p in enumerate(self.queue, 1):
+                if p is pkg:
+                    return i
+        return 0
 
     def _drain_queue(self):
         """Vacía la cola y devuelve lo que había."""

@@ -281,3 +281,44 @@ def test_lo_que_se_encola_justo_al_final_no_queda_dormido(monkeypatch, _consola_
 
     assert len(_consola_ok) == 2, "el que entró tarde nunca salió"
     assert app.installing is False
+
+
+# ---------------------------------------------------------- sacar de la cola
+
+
+def test_se_puede_sacar_uno_sin_voltear_la_tanda():
+    """
+    Encolar cinco y arrepentirse de uno no puede obligar a cancelar todo:
+    los que ya salieron están descargando en la consola y volverían a cero.
+    """
+    app = _app()
+    a, b, c = _pkg("a.pkg"), _pkg("b.pkg"), _pkg("c.pkg")
+    app.pkgs = [a, b, c]
+    app._enqueue([a, b, c])
+
+    app.unqueue(b)
+
+    assert [p["name"] for p in app.queue] == ["a.pkg", "c.pkg"]
+    assert b["state"] == "idle", "no se puede volver a tildar"
+
+
+def test_sacar_algo_que_ya_salio_no_hace_nada():
+    """Una vez enviado ya no es cosa de la cola: se cancela con stop_task."""
+    app = _app()
+    pkg = _pkg(state="downloading")
+    app.pkgs = [pkg]
+
+    app.unqueue(pkg)
+
+    assert pkg["state"] == "downloading"
+
+
+def test_cada_uno_sabe_que_lugar_ocupa():
+    app = _app()
+    a, b = _pkg("a.pkg"), _pkg("b.pkg")
+    app.pkgs = [a, b]
+    app._enqueue([a, b])
+
+    assert app.posicion_en_cola(a) == 1
+    assert app.posicion_en_cola(b) == 2
+    assert app.posicion_en_cola(_pkg("otro.pkg")) == 0
